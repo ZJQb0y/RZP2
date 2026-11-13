@@ -1,0 +1,222 @@
+.TH RZP2 1 "2026-11-13" "rzp2 0.8.0" "用户命令"
+.SH 名称
+rzp2 \- 混合加密压缩工具（LZMA + ML-KEM + ChaCha20-Poly1305）
+.SH 语法
+.B rzp2
+.I 子命令
+.RI [ 选项 ]
+.SH 描述
+RZP2 是一个从零自研的混合加密压缩工具，核心算法全部手写实现：
+LZMA 压缩、ML-KEM（FIPS 203）密钥封装、ChaCha20-Poly1305 对称加密、
+Argon2id 口令派生与 SHAKE-256 密钥派生。容器格式为
+.BR .rzp2 。
+.PP
+压缩 / 解压 / 分片 / 合并时在终端显示 [===>] 风格进度条，含百分比与工作类型。
+.SH 子命令
+.TP
+.B compress
+压缩（可选加密）为 .rzp2 容器，支持单文件与目录归档。
+.TP
+.B decompress
+解压（可选解密）.rzp2 容器。
+.TP
+.B keygen
+生成 ML-KEM 长期公私钥对。
+.TP
+.B list
+列出归档条目。
+.TP
+.B test
+校验容器完整性。
+.TP
+.B info
+查看容器元信息。
+.TP
+.B sfx
+生成自解压可执行文件（把 rzp2 自身作为存根追加 .rzp2 载荷）。
+.TP
+.B split
+把文件切成多个分片（每片大小可配置，默认 10 MiB）。
+.TP
+.B merge
+把分片按清单合并回原文件。
+.TP
+.B completion
+生成 shell Tab 补全脚本。
+.TP
+.BR \-\-help
+显示帮助。
+.TP
+.BR \-\-version
+显示版本。
+.SH compress 选项
+.TP
+.BR \-o ", " \-\-output " 文件"
+输出文件（默认 <input>.rzp2；\- 表示 stdout）。
+.TP
+.BR \-e ", " \-\-encrypt
+使用 ML-KEM 混合加密（需 \-\-public-key）。
+.TP
+.BR \-\-public-key " 文件"
+接收方公钥（PEM）。
+.TP
+.BR \-\-params " 参数集"
+ML-KEM 参数集：mlkem512 / mlkem768 / mlkem1024。
+.TP
+.BR \-\-password " 口令"
+使用口令加密（Argon2id，\- 表示交互式无回显读取）。
+.TP
+.BR \-\-level " 级别"
+压缩级别 0..=9（默认 5）。
+.TP
+.BR \-\-dict-size " 字节"
+覆盖字典大小。
+.TP
+.BR \-\-checksum
+附加未压缩明文 SHAKE-256 校验和。
+.TP
+.BR \-\-dry-run
+只打印将执行的动作，不实际读写。
+.TP
+.BR \-f ", " \-\-force
+覆盖已存在的输出文件。
+.SH decompress 选项
+.TP
+.BR \-o ", " \-\-output " 文件"
+输出文件或目录（默认去掉 .rzp2；\- 表示 stdout）。
+.TP
+.BR \-\-private-key " 文件"
+接收方私钥（PEM，ML-KEM 加密容器必需）。
+.TP
+.BR \-\-password " 口令"
+口令（口令加密容器必需，\- 表示交互式无回显读取）。
+.TP
+.BR \-\-key-password " 口令"
+加密私钥文件的口令（\- 表示交互式无回显读取）。
+.TP
+.BR \-\-entry " 路径"
+仅从归档中抽取单个条目（配合 \-o \- 输出到 stdout）。
+.TP
+.BR \-\-dry-run
+只打印将执行的动作，不实际读写。
+.TP
+.BR \-f ", " \-\-force
+覆盖已存在的输出文件。
+.SH list / test 选项
+.TP
+.BR \-\-private-key " 文件"
+接收方私钥（PEM）。
+.TP
+.BR \-\-password " 口令"
+口令。
+.SH list 选项
+.TP
+.BR \-l ", " \-\-long
+长格式：权限、大小、mtime、符号链接目标。
+.TP
+.BR \-\-human-readable
+以 B / KiB / MiB 等可读单位显示大小。
+.SH keygen 选项
+.TP
+.BR \-\-params " 参数集"
+ML-KEM 参数集（默认 mlkem768）。
+.TP
+.BR \-\-public " 文件"
+公钥输出路径（默认 rzp2_<params>.key.pub）。
+.TP
+.BR \-\-private " 文件"
+私钥输出路径（默认 rzp2_<params>.key）。
+.TP
+.BR \-\-private-password " 口令"
+用口令加密私钥（\- 表示交互式无回显读取）。
+.SH sfx 选项
+.TP
+.BR \-o ", " \-\-output " 文件"
+输出自解压可执行文件（默认 <input> 去 .rzp2，Windows 加 .exe）。
+.TP
+.BR \-f ", " \-\-force
+覆盖已存在的输出文件。
+.SH split 选项
+.TP
+.BR \-o ", " \-\-output " 前缀"
+分片输出前缀（默认 <input>）。
+.TP
+.BR \-\-chunk-size " 字节"
+每个分片大小（默认 10 MiB）。
+.TP
+.BR \-\-dry-run
+只打印将执行的动作，不实际读写。
+.TP
+.BR \-f ", " \-\-force
+覆盖已存在的分片 / 清单。
+.SH merge 选项
+.TP
+.BR \-o ", " \-\-output " 文件"
+输出文件（默认取清单记录的原始文件名）。
+.TP
+.BR \-\-dry-run
+只打印将执行的动作，不实际读写。
+.TP
+.BR \-f ", " \-\-force
+覆盖已存在的输出文件。
+.SH 示例
+生成密钥对：
+.nf
+\fBrzp2 keygen --params mlkem768 --public pub.key --private priv.key\fR
+.fi
+压缩（未加密）：
+.nf
+\fBrzp2 compress input.txt -o output.rzp2 --checksum\fR
+.fi
+压缩并加密：
+.nf
+\fBrzp2 compress input.txt -o output.rzp2 --encrypt --public-key pub.key --checksum\fR
+.fi
+口令加密：
+.nf
+\fBrzp2 compress input.txt -o output.rzp2 --password -\fR
+.fi
+压缩目录：
+.nf
+\fBrzp2 compress ./docs -o docs.rzp2\fR
+.fi
+解压（未加密）：
+.nf
+\fBrzp2 decompress output.rzp2 -o restored.txt\fR
+.fi
+解压并解密：
+.nf
+\fBrzp2 decompress output.rzp2 -o restored.txt --private-key priv.key\fR
+.fi
+查看归档 / 校验 / 元信息：
+.nf
+\fBrzp2 list docs.rzp2\fR
+\fBrzp2 test docs.rzp2\fR
+\fBrzp2 info docs.rzp2\fR
+.fi
+生成自解压：
+.nf
+\fBrzp2 sfx docs.rzp2 -o docs.exe\fR
+.fi
+分片与合并：
+.nf
+\fBrzp2 split big.bin -o parts --chunk-size 1048576\fR
+\fBrzp2 merge parts.manifest -o big.bin\fR
+.fi
+.SH 补全
+rzp2 内置 bash / zsh / fish / PowerShell 的 Tab 补全，可通过以下命令生成补全脚本：
+.nf
+\fBrzp2 completion bash\fR
+\fBrzp2 completion zsh\fR
+\fBrzp2 completion fish\fR
+\fBrzp2 completion powershell\fR
+.fi
+例如输入
+.B rzp c
+后按 Tab 会自动补全为
+.BR compress 。
+.SH 退出码
+0 表示成功，1 表示运行期错误（读 / 写 / 编解码失败等），2 表示命令行参数错误。
+.SH 参见
+.BR rzp2 (1),
+README.md、FORMAT.md（格式规范）、API.md（库 API）。

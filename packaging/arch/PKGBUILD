@@ -1,0 +1,40 @@
+# 本地构建用的 Arch PKGBUILD 模板：package.sh 用它在本机生成 .pkg.tar.zst。
+#
+# 与 packaging/aur/PKGBUILD 的区别：
+#   该文件面向 AUR、从 GitHub 标签拉取源码；
+#   本模板从 package.sh 生成的本地源码包 rzp2-${pkgver}.tar.gz 构建，
+#   pkgver 由脚本根据 Cargo.toml 注入（@VERSION@）。
+pkgname=rzp2
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="From-scratch hybrid encryption compression tool (LZMA + ML-KEM + ChaCha20-Poly1305)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ZJQb0y/rzp2"
+license=('MIT' 'Apache-2.0')
+source=("rzp2-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "${pkgname}-${pkgver}"
+  cargo build --release --locked
+}
+
+package() {
+  cd "${pkgname}-${pkgver}"
+  install -Dm755 target/release/rzp2 "${pkgdir}/usr/bin/rzp2"
+  install -Dm644 LICENSE   "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 LICENSE-MIT "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 FORMAT.md "${pkgdir}/usr/share/doc/${pkgname}/FORMAT.md"
+  install -Dm644 API.md    "${pkgdir}/usr/share/doc/${pkgname}/API.md"
+  install -Dm644 man/rzp2.1 "${pkgdir}/usr/share/man/man1/rzp2.1"
+
+  # shell Tab 补全脚本（bash / zsh / fish）。
+  install -d "${pkgdir}/usr/share/bash-completion/completions"
+  install -d "${pkgdir}/usr/share/zsh/site-functions"
+  install -d "${pkgdir}/usr/share/fish/vendor_completions.d"
+  target/release/rzp2 completion bash > "${pkgdir}/usr/share/bash-completion/completions/rzp2"
+  target/release/rzp2 completion zsh  > "${pkgdir}/usr/share/zsh/site-functions/_rzp2"
+  target/release/rzp2 completion fish > "${pkgdir}/usr/share/fish/vendor_completions.d/rzp2.fish"
+}
