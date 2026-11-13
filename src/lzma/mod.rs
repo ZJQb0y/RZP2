@@ -6,6 +6,7 @@
 pub mod decoder;
 pub mod encoder;
 pub mod lz_encoder;
+pub mod lzma2;
 pub mod match_finder;
 pub mod prob_model;
 pub mod range_coder;
@@ -154,7 +155,7 @@ pub fn encode_stream<R: std::io::Read, W: std::io::Write>(
     Ok(n as u64)
 }
 
-/// 分块并行压缩：把输入按 `block_size` 切成独立块，用 `threads` 个工作线程并行编码，
+/// 分块并行压缩：把输入按 `block_size` 切成独立块，用 `processes` 个工作进程并行编码，
 /// 返回 `len(4 LE) + block` 帧序列，以 `len=0` 终止（块各自为完整 alone 流）。
 ///
 /// 与 [`encode`] 不同，输出不是单条 alone 流，需用 [`decode_blocks`] 解压。
@@ -162,39 +163,24 @@ pub fn encode_blocks(
     input: &[u8],
     params: &LzmaParams,
     block_size: usize,
-    threads: usize,
+    processes: usize,
 ) -> Vec<u8> {
     let block_size = block_size.max(1);
     let blocks: Vec<&[u8]> = input.chunks(block_size).collect();
     let n = blocks.len();
 
-    // 零依赖并行：`std::thread::scope` + 原子计数器做工作窃取，结果按块序号回填。
-    let slots: Vec<std::sync::Mutex<Option<Vec<u8>>>> =
-        (0..n).map(|_| std::sync::Mutex::new(None)).collect();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-
-    std::thread::scope(|scope| {
-        let workers = threads.clamp(1, n.max(1));
-        for _ in 0..workers {
-            let slots = &slots;
-            let next = &next;
-            let blocks = &blocks;
-            scope.spawn(move || loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if i >= n {
-                    break;
-                }
-                let encoded = encode(blocks[i], params);
-                *slots[i].lock().unwrap() = Some(encoded);
-            });
-        }
-    });
+    // 多进程并行：见 `crate::parallel::encode_blocks_parallel`。
+    let encoded = crate::parallel::encode_blocks_parallel(
+        crate::parallel::Encoder::Lzma,
+        &blocks,
+        params,
+        processes,
+    );
 
     let mut out = Vec::with_capacity(input.len() / 2 + n * 4);
-    for slot in &slots {
-        let encoded = slot.lock().unwrap().take().unwrap();
-        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-        out.extend_from_slice(&encoded);
+    for block in encoded {
+        out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        out.extend_from_slice(&block);
     }
     out.extend_from_slice(&0u32.to_le_bytes());
     out
@@ -363,7 +349,7 @@ mod tests {
             input.push((i % 251) as u8);
             input.extend_from_slice(b"blocked-lzma-");
         }
-        // 多块 + 多线程，结果必须与单块/单线程语义一致（内容一致）。
+        // 多块 + 多进程，结果必须与单块/单进程语义一致（内容一致）。
         let packed = encode_blocks(&input, &params, 64 * 1024, 4);
         let out = decode_blocks(&packed).unwrap();
         assert_eq!(out, input);

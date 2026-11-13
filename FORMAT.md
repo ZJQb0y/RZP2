@@ -121,7 +121,7 @@ ChaCha20-Poly1305 密文 + 明文校验和」，并可选承载目录归档流�
 ```
 
 - 每个 `block` 是自包含的 LZMA alone 流，解压时逐帧解压后按序拼接明文。
-- 分块大小由 CLI `--block-size` 控制（默认 4 MiB），线程数由 `--threads` 控制。
+- 分块大小由 CLI `--block-size` 控制（默认 4 MiB），进程数由 `--processes` 控制。
 - `BLOCKED` 与 `CHUNKED` 正交：前者描述压缩层布局，后者描述加密层 AEAD 帧封装。
 
 ## 头部标志位 `flags`

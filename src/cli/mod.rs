@@ -7,26 +7,37 @@
 //! - `list`：列出归档条目
 //! - `test`：校验容器完整性
 //! - `info`：查看容器元信息
+//! - `bench`：运行性能基准（吞吐 / 每秒操作数）
+
+pub mod completion;
+pub mod sfx;
 
 use std::fs::File;
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::archive::{
     decode_archive, encode_archive, Entry, EntryKind, EntrySink, StreamEntry, StreamUnpacker,
 };
 use crate::format::{Header, KemParams, MAGIC, VERSION};
-use crate::hybrid::{DEFAULT_ITERATIONS, DEFAULT_LANES, DEFAULT_MEMORY_KIB};
+use crate::hybrid::{
+    derive_password_key, DEFAULT_ITERATIONS, DEFAULT_LANES, DEFAULT_MEMORY_KIB,
+};
 use crate::keys::{
     decode_key, decode_private_key, encode_encrypted_private_key, encode_key, KeyKind,
 };
 use crate::lzma::{self, LzmaParams};
+use crate::mlkem;
 use crate::pipeline::{
-    mlkem_params, pack, pack_stream_with_size, pack_to_writer, unpack, unpack_to_writer,
-    DecryptKey, Encryption, PackConfig, PipelineError,
+    checksum, mlkem_params, pack, pack_stream_with_size, pack_to_writer, unpack,
+    unpack_to_writer, DecryptKey, Encryption, PackConfig, PipelineError,
 };
 use crate::progress::{Progress, ProgressReader, ProgressWriter};
 use crate::split;
+use crate::xz;
+use crate::{aead, crypto::blake2b};
 
 /// 终端 ANSI 颜色支持：零依赖，非终端（重定向/管道）自动禁用。
 mod style {
@@ -97,6 +108,9 @@ enum Action {
     Sfx(SfxOpts),
     Split(SplitOpts),
     Merge(MergeOpts),
+    Bench(BenchOpts),
+    Xz(XzOpts),
+    Unxz(UnxzOpts),
 }
 
 struct CompressOpts {
@@ -113,7 +127,7 @@ struct CompressOpts {
     force: bool,
     include: Vec<String>,
     exclude: Vec<String>,
-    threads: usize,
+    processes: usize,
     block_size: usize,
     dry_run: bool,
 }
@@ -184,6 +198,36 @@ struct MergeOpts {
     dry_run: bool,
 }
 
+struct BenchOpts {
+    size: usize,
+    processes: Option<usize>,
+    image: Option<String>,
+    video: Option<String>,
+    audio: Option<String>,
+    text: Option<String>,
+    level: Option<u8>,
+    budget_ms: Option<u64>,
+    json: bool,
+}
+
+struct XzOpts {
+    input: String,
+    output: String,
+    level: u8,
+    dict_size: Option<u32>,
+    block_size: Option<usize>,
+    processes: Option<usize>,
+    force: bool,
+    dry_run: bool,
+}
+
+struct UnxzOpts {
+    input: String,
+    output: String,
+    force: bool,
+    dry_run: bool,
+}
+
 /// 解密凭据（已读入内存的私钥或口令）。
 enum Credential {
     None,
@@ -217,6 +261,9 @@ pub fn run(args: &[String]) -> i32 {
         Ok(Action::Sfx(o)) => cmd_sfx(&o),
         Ok(Action::Split(o)) => cmd_split(&o),
         Ok(Action::Merge(o)) => cmd_merge(&o),
+        Ok(Action::Bench(o)) => cmd_bench(&o),
+        Ok(Action::Xz(o)) => cmd_xz(&o),
+        Ok(Action::Unxz(o)) => cmd_unxz(&o),
         Err(e) => {
             eprintln!("{}: {e}", err_prefix());
             eprintln!("运行 `rzp2 --help` 查看用法。");
@@ -242,6 +289,9 @@ fn parse(args: &[String]) -> Result<Action, String> {
         "sfx" => Ok(Action::Sfx(parse_sfx(&args[1..])?)),
         "split" => Ok(Action::Split(parse_split(&args[1..])?)),
         "merge" => Ok(Action::Merge(parse_merge(&args[1..])?)),
+        "bench" => Ok(Action::Bench(parse_bench(&args[1..])?)),
+        "xz" => Ok(Action::Xz(parse_xz(&args[1..])?)),
+        "unxz" => Ok(Action::Unxz(parse_unxz(&args[1..])?)),
         other => Err(format!("未知子命令 `{other}`")),
     }
 }
@@ -337,6 +387,24 @@ fn default_compress_output(input: &str) -> String {
     }
 }
 
+/// 未指定 `-o` 时 xz 的默认输出：输入名后追加 `.xz`（stdin 则输出到 stdout）。
+fn default_xz_output(input: &str) -> String {
+    if input == "-" {
+        "-".to_string()
+    } else {
+        format!("{input}.xz")
+    }
+}
+
+/// 未指定 `-o` 时 unxz 的默认输出：去掉结尾的 `.xz`（stdin 则输出到 stdout）。
+fn default_unxz_output(input: &str) -> String {
+    if input == "-" {
+        "-".to_string()
+    } else {
+        input.strip_suffix(".xz").unwrap_or(input).to_string()
+    }
+}
+
 /// 未指定 `-o` 时解压的默认输出：去掉结尾的 `.rzp2` 还原原名（stdin 则输出到 stdout）。
 fn default_decompress_output(input: &str) -> Result<String, String> {
     if input == "-" {
@@ -375,7 +443,7 @@ fn parse_compress(args: &[String]) -> Result<CompressOpts, String> {
     let mut force = false;
     let mut include: Vec<String> = Vec::new();
     let mut exclude: Vec<String> = Vec::new();
-    let mut threads: usize = 1;
+    let mut processes: usize = 1;
     let mut block_size: usize = lzma::DEFAULT_BLOCK_SIZE;
     let mut dry_run = false;
 
@@ -402,7 +470,7 @@ fn parse_compress(args: &[String]) -> Result<CompressOpts, String> {
             }
             "--include" => include.push(it.value(flag, inline)?),
             "--exclude" => exclude.push(it.value(flag, inline)?),
-            "--threads" => threads = parse_usize_option(flag, &it.value(flag, inline)?)?,
+            "--processes" => processes = parse_usize_option(flag, &it.value(flag, inline)?)?,
             "--block-size" => block_size = parse_usize_option(flag, &it.value(flag, inline)?)?,
             "-f" | "--force" | "--overwrite" => {
                 reject_value(flag, inline)?;
@@ -443,7 +511,7 @@ fn parse_compress(args: &[String]) -> Result<CompressOpts, String> {
         force,
         include,
         exclude,
-        threads,
+        processes,
         block_size,
         dry_run,
     })
@@ -508,6 +576,96 @@ fn parse_decompress(args: &[String]) -> Result<DecompressOpts, String> {
         force,
         dry_run,
         entry,
+    })
+}
+
+fn parse_xz(args: &[String]) -> Result<XzOpts, String> {
+    let mut it = Args::new(args);
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    let mut level = lzma::DEFAULT_LEVEL;
+    let mut dict_size: Option<u32> = None;
+    let mut block_size: Option<usize> = None;
+    let mut processes: Option<usize> = None;
+    let mut force = false;
+    let mut dry_run = false;
+
+    while let Some(token) = it.next() {
+        let (flag, inline) = split_option(token);
+        match flag {
+            "-o" | "--output" => output = Some(it.value(flag, inline)?),
+            "--level" => level = parse_level(&it.value(flag, inline)?)?,
+            "--dict-size" => dict_size = Some(parse_dict_size(&it.value(flag, inline)?)?),
+            "--block-size" => {
+                block_size = Some(parse_usize_option(flag, &it.value(flag, inline)?)?)
+            }
+            "--processes" => processes = Some(parse_usize_option(flag, &it.value(flag, inline)?)?),
+            "-f" | "--force" | "--overwrite" => {
+                reject_value(flag, inline)?;
+                force = true;
+            }
+            "--dry-run" => {
+                reject_value(flag, inline)?;
+                dry_run = true;
+            }
+            "-h" | "--help" => return Err("xz 用法见 `rzp2 --help`".into()),
+            _ if flag.starts_with('-') && token != "-" => {
+                return Err(format!("未知选项 `{token}`"))
+            }
+            _ if input.is_none() => input = Some(token.to_string()),
+            _ => return Err(format!("多余的位置参数 `{token}`")),
+        }
+    }
+
+    let input = input.ok_or("缺少输入文件")?;
+    let output = output.unwrap_or_else(|| default_xz_output(&input));
+    Ok(XzOpts {
+        input,
+        output,
+        level,
+        dict_size,
+        block_size,
+        processes,
+        force,
+        dry_run,
+    })
+}
+
+fn parse_unxz(args: &[String]) -> Result<UnxzOpts, String> {
+    let mut it = Args::new(args);
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    let mut force = false;
+    let mut dry_run = false;
+
+    while let Some(token) = it.next() {
+        let (flag, inline) = split_option(token);
+        match flag {
+            "-o" | "--output" => output = Some(it.value(flag, inline)?),
+            "-f" | "--force" | "--overwrite" => {
+                reject_value(flag, inline)?;
+                force = true;
+            }
+            "--dry-run" => {
+                reject_value(flag, inline)?;
+                dry_run = true;
+            }
+            "-h" | "--help" => return Err("unxz 用法见 `rzp2 --help`".into()),
+            _ if flag.starts_with('-') && token != "-" => {
+                return Err(format!("未知选项 `{token}`"))
+            }
+            _ if input.is_none() => input = Some(token.to_string()),
+            _ => return Err(format!("多余的位置参数 `{token}`")),
+        }
+    }
+
+    let input = input.ok_or("缺少输入文件")?;
+    let output = output.unwrap_or_else(|| default_unxz_output(&input));
+    Ok(UnxzOpts {
+        input,
+        output,
+        force,
+        dry_run,
     })
 }
 
@@ -821,6 +979,58 @@ fn derive_merge_output(input: &str) -> Result<String, String> {
         return Err(format!("无法从 `{input}` 推导输出（请用 -o 指定）"));
     }
     Ok(stripped.to_string())
+}
+
+fn parse_bench(args: &[String]) -> Result<BenchOpts, String> {
+    let mut it = Args::new(args);
+    let mut size: usize = 1 << 20; // 默认 1 MiB
+    let mut processes: Option<usize> = None;
+    let mut image: Option<String> = None;
+    let mut video: Option<String> = None;
+    let mut audio: Option<String> = None;
+    let mut text: Option<String> = None;
+    let mut level: Option<u8> = None;
+    let mut budget_ms: Option<u64> = None;
+    let mut json = false;
+
+    while let Some(token) = it.next() {
+        let (flag, inline) = split_option(token);
+        match flag {
+            "--size" => size = parse_usize_option(flag, &it.value(flag, inline)?)?,
+            "--processes" => {
+                processes = Some(parse_usize_option(flag, &it.value(flag, inline)?)?)
+            }
+            "--image" => image = Some(it.value(flag, inline)?),
+            "--video" => video = Some(it.value(flag, inline)?),
+            "--audio" => audio = Some(it.value(flag, inline)?),
+            "--text" => text = Some(it.value(flag, inline)?),
+            "--level" => level = Some(parse_level(&it.value(flag, inline)?)?),
+            "--budget" => {
+                budget_ms = Some(parse_usize_option(flag, &it.value(flag, inline)?)? as u64)
+            }
+            "--json" => {
+                reject_value(flag, inline)?;
+                json = true;
+            }
+            "-h" | "--help" => return Err("bench 用法见 `rzp2 --help`".into()),
+            _ if flag.starts_with('-') && token != "-" => {
+                return Err(format!("未知选项 `{token}`"))
+            }
+            _ => return Err(format!("多余的位置参数 `{token}`")),
+        }
+    }
+
+    Ok(BenchOpts {
+        size,
+        processes,
+        image,
+        video,
+        audio,
+        text,
+        level,
+        budget_ms,
+        json,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,7 +1449,7 @@ fn cmd_compress(o: &CompressOpts) -> i32 {
         add_checksum: o.checksum,
         archive,
         encryption,
-        threads: o.threads,
+        processes: o.processes,
         block_size: o.block_size,
     };
 
@@ -1274,7 +1484,7 @@ fn cmd_compress(o: &CompressOpts) -> i32 {
             return 1;
         }
         (len, out_len)
-    } else if o.threads > 1 {
+    } else if o.processes > 1 {
         // 分块并行压缩：需整段载入以切块，使用缓冲式打包（同时支持校验和）。
         let mut reader = match open_input_stream(&o.input) {
             Ok(r) => r,
@@ -1414,7 +1624,13 @@ fn cmd_decompress(o: &DecompressOpts) -> i32 {
         }
     };
 
-    let cred = match load_credential(&header, &o.private_key, &o.password, &o.key_password, o.ask_pass) {
+    let cred = match load_credential(
+        &header,
+        &o.private_key,
+        &o.password,
+        &o.key_password,
+        o.ask_pass,
+    ) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{}: {e}", err_prefix());
@@ -1433,7 +1649,11 @@ fn cmd_decompress(o: &DecompressOpts) -> i32 {
             let plaintext = match unpack(&buf, credential_to_key(&cred)) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("{}: {}", err_prefix(), pipeline_error_message("解压失败", &e));
+                    eprintln!(
+                        "{}: {}",
+                        err_prefix(),
+                        pipeline_error_message("解压失败", &e)
+                    );
                     return 1;
                 }
             };
@@ -1492,7 +1712,11 @@ fn cmd_decompress(o: &DecompressOpts) -> i32 {
         }
         let mut extractor = ArchiveExtractor::new(out_dir);
         if let Err(e) = unpack_to_writer(&buf, credential_to_key(&cred), &mut extractor) {
-            eprintln!("{}: {}", err_prefix(), pipeline_error_message("解压失败", &e));
+            eprintln!(
+                "{}: {}",
+                err_prefix(),
+                pipeline_error_message("解压失败", &e)
+            );
             return 1;
         }
         match extractor.finish() {
@@ -1520,7 +1744,11 @@ fn cmd_decompress(o: &DecompressOpts) -> i32 {
         } else {
             header.original_size
         };
-        let label = if header.encrypted { "解密+解压" } else { "解压" };
+        let label = if header.encrypted {
+            "解密+解压"
+        } else {
+            "解压"
+        };
         match stream_decompress(&o.output, &buf, credential_to_key(&cred), total, label) {
             Ok(written) => {
                 println_status(
@@ -1543,6 +1771,106 @@ fn cmd_decompress(o: &DecompressOpts) -> i32 {
     0
 }
 
+fn cmd_xz(o: &XzOpts) -> i32 {
+    if o.dry_run {
+        let multi = if o.block_size.is_some() || o.processes.is_some() {
+            "（多块）"
+        } else {
+            ""
+        };
+        println!(
+            "将压缩 `{}` → `{}`（级别 {}，.xz{}）",
+            o.input, o.output, o.level, multi
+        );
+        return 0;
+    }
+
+    let data = match read_input(&o.input) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{}: {e}", err_prefix());
+            return 1;
+        }
+    };
+    let params = build_lzma_params(o.level, o.dict_size);
+    let packed = match (o.block_size, o.processes) {
+        (Some(_), _) | (_, Some(_)) => {
+            let block_size = o.block_size.unwrap_or(lzma::DEFAULT_BLOCK_SIZE);
+            let processes = o.processes.unwrap_or(1);
+            xz::encode_blocks(&data, &params, block_size, processes)
+        }
+        _ => xz::encode(&data, &params),
+    };
+    let packed = match packed {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}: 压缩失败: {e}", err_prefix());
+            return 1;
+        }
+    };
+    if let Err(e) = ensure_not_exists(&o.output, o.force) {
+        eprintln!("{}: {e}", err_prefix());
+        return 1;
+    }
+    if let Err(e) = write_output(&o.output, &packed) {
+        eprintln!("{}: {e}", err_prefix());
+        return 1;
+    }
+    println_status(
+        &o.output,
+        format!(
+            "{} `{}` → `{}`（{} → {} 字节）",
+            style::paint("已压缩", style::Color::Green, style::stdout_tty()),
+            o.input,
+            o.output,
+            data.len(),
+            packed.len()
+        ),
+    );
+    0
+}
+
+fn cmd_unxz(o: &UnxzOpts) -> i32 {
+    if o.dry_run {
+        println!("将解压 `{}` → `{}`", o.input, o.output);
+        return 0;
+    }
+
+    let packed = match read_input(&o.input) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{}: {e}", err_prefix());
+            return 1;
+        }
+    };
+    let data = match xz::decode(&packed) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{}: 解压失败: {e}", err_prefix());
+            return 1;
+        }
+    };
+    if let Err(e) = ensure_not_exists(&o.output, o.force) {
+        eprintln!("{}: {e}", err_prefix());
+        return 1;
+    }
+    if let Err(e) = write_output(&o.output, &data) {
+        eprintln!("{}: {e}", err_prefix());
+        return 1;
+    }
+    println_status(
+        &o.output,
+        format!(
+            "{} `{}` → `{}`（{} 字节）",
+            style::paint("已解压", style::Color::Green, style::stdout_tty()),
+            o.input,
+            o.output,
+            data.len()
+        ),
+    );
+    0
+}
+
 fn cmd_list(o: &ListOpts) -> i32 {
     let buf = match read_input(&o.input) {
         Ok(b) => b,
@@ -1558,7 +1886,13 @@ fn cmd_list(o: &ListOpts) -> i32 {
             return 1;
         }
     };
-    let cred = match load_credential(&header, &o.private_key, &o.password, &o.key_password, o.ask_pass) {
+    let cred = match load_credential(
+        &header,
+        &o.private_key,
+        &o.password,
+        &o.key_password,
+        o.ask_pass,
+    ) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{}: {e}", err_prefix());
@@ -1568,7 +1902,11 @@ fn cmd_list(o: &ListOpts) -> i32 {
     let plaintext = match unpack(&buf, credential_to_key(&cred)) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("{}: {}", err_prefix(), pipeline_error_message("解压失败", &e));
+            eprintln!(
+                "{}: {}",
+                err_prefix(),
+                pipeline_error_message("解压失败", &e)
+            );
             return 1;
         }
     };
@@ -1619,7 +1957,13 @@ fn cmd_test(o: &TestOpts) -> i32 {
             return 1;
         }
     };
-    let cred = match load_credential(&header, &o.private_key, &o.password, &o.key_password, o.ask_pass) {
+    let cred = match load_credential(
+        &header,
+        &o.private_key,
+        &o.password,
+        &o.key_password,
+        o.ask_pass,
+    ) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{}: {e}", err_prefix());
@@ -1629,7 +1973,11 @@ fn cmd_test(o: &TestOpts) -> i32 {
     let plaintext = match unpack(&buf, credential_to_key(&cred)) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("{}: {}", err_prefix(), pipeline_error_message("校验失败", &e));
+            eprintln!(
+                "{}: {}",
+                err_prefix(),
+                pipeline_error_message("校验失败", &e)
+            );
             return 1;
         }
     };
@@ -1740,7 +2088,7 @@ fn cmd_completion(o: &CompletionOpts) -> i32 {
         eprintln!("用法: rzp2 completion <bash|zsh|fish|powershell>");
         return 2;
     };
-    match crate::completion::render(shell) {
+    match self::completion::render(shell) {
         Ok(script) => {
             print!("{script}");
             0
@@ -1760,7 +2108,7 @@ fn cmd_sfx(o: &SfxOpts) -> i32 {
             return 1;
         }
     };
-    match crate::sfx::create(&stub, Path::new(&o.input), Path::new(&o.output), o.force) {
+    match self::sfx::create(&stub, Path::new(&o.input), Path::new(&o.output), o.force) {
         Ok(len) => {
             println!(
                 "{} `{}`（内嵌 {} 字节，存根 `{}`）",
@@ -1789,8 +2137,9 @@ fn cmd_split(o: &SplitOpts) -> i32 {
 
     let total = std::fs::metadata(&o.input).map(|m| m.len()).unwrap_or(0);
     let mut progress = Progress::new("分片", total, style::stderr_tty());
-    match split::split_file(&o.input, &o.prefix, o.chunk_size, o.force, |done| progress.update(done))
-    {
+    match split::split_file(&o.input, &o.prefix, o.chunk_size, o.force, |done| {
+        progress.update(done)
+    }) {
         Ok(count) => {
             progress.finish();
             println_status(
@@ -1860,6 +2209,847 @@ fn cmd_merge(o: &MergeOpts) -> i32 {
             1
         }
     }
+}
+
+/// 构造基准用的 `PackConfig`（单进程、不归档，避免进度条与多进程干扰计时）。
+fn bench_config<'a>(encryption: Encryption<'a>, add_checksum: bool) -> PackConfig<'a> {
+    PackConfig {
+        params: LzmaParams::default(),
+        level: lzma::DEFAULT_LEVEL,
+        add_checksum,
+        archive: false,
+        encryption,
+        processes: 1,
+        block_size: lzma::DEFAULT_BLOCK_SIZE,
+    }
+}
+
+/// 生成一段混合可压缩数据（部分规律、部分伪随机）。
+fn bench_sample_data(n: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(n);
+    for i in 0..n {
+        let b = if i % 1024 < 800 {
+            (i % 251) as u8
+        } else {
+            (i.wrapping_mul(2654435761) >> 13) as u8
+        };
+        data.push(b);
+    }
+    data
+}
+
+/// 确定性伪随机生成器（LCG），保证各类合成数据跨机器可复现。
+struct Lcg(u64);
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u8(&mut self) -> u8 {
+        // Numerical Recipes 的 64 位 LCG 常数。
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 56) as u8
+    }
+}
+
+/// 生成模拟纯文本数据（重复句子 + 递增行号，高度可压缩）。
+fn bench_text_data(n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n);
+    let mut line = 0u32;
+    while out.len() < n {
+        let _ = writeln!(out, "line {line}: the quick brown fox jumps over the lazy dog.");
+        line += 1;
+    }
+    out.truncate(n);
+    out
+}
+
+/// 生成模拟原始灰度图数据（像素值随坐标渐变 + 轻微噪声，具空间相关性）。
+fn bench_image_data(n: usize) -> Vec<u8> {
+    const WIDTH: usize = 512;
+    let mut out = Vec::with_capacity(n);
+    let mut rng = Lcg::new(0x0123_4567_89ab_cdef);
+    for i in 0..n {
+        let x = i % WIDTH;
+        let y = i / WIDTH;
+        let base = ((x.wrapping_mul(3).wrapping_add(y.wrapping_mul(5))) & 0xff) as u8;
+        out.push(base.wrapping_add(rng.next_u8() & 0x07));
+    }
+    out
+}
+
+/// 生成模拟原始 PCM 音频数据（基波 + 谐波 + 轻微噪声，具周期性）。
+fn bench_audio_data(n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n);
+    let mut rng = Lcg::new(0xfedc_ba98_7654_3210);
+    for i in 0..n {
+        let fundamental = ((i % 512) * 255 / 511) as u8;
+        let harmonic = ((i % 89) * 127 / 88) as u8;
+        out.push(
+            fundamental
+                .wrapping_add(harmonic)
+                .wrapping_add(rng.next_u8() & 0x03),
+        );
+    }
+    out
+}
+
+/// 生成模拟原始视频帧序列数据（帧间高度相似，具时间冗余）。
+fn bench_video_data(n: usize) -> Vec<u8> {
+    const WIDTH: usize = 512;
+    const HEIGHT: usize = 512;
+    let mut out = Vec::with_capacity(n);
+    let mut rng = Lcg::new(0x0bad_f00d_d00d_0001);
+    let mut frame = 0u64;
+    while out.len() < n {
+        for i in 0..(WIDTH * HEIGHT) {
+            if out.len() >= n {
+                break;
+            }
+            let x = i % WIDTH;
+            let y = i / WIDTH;
+            let base = ((x.wrapping_add(y.wrapping_mul(2)).wrapping_add(frame as usize)) & 0xff)
+                as u8;
+            out.push(base.wrapping_add(rng.next_u8() & 0x01));
+        }
+        frame += 1;
+    }
+    out
+}
+
+/// 在时间预算内反复执行 `f`，返回中位每操作耗时（秒）。
+///
+/// 先做少量预热排除冷缓存/首次分配等一次性开销，再分多轮测量取中位，降低抖动。
+fn run_bench(budget: Duration, mut f: impl FnMut()) -> f64 {
+    const WARMUP: u32 = 2;
+    const ROUNDS: u32 = 3;
+
+    for _ in 0..WARMUP {
+        f();
+    }
+
+    let mut per_iter = Vec::with_capacity(ROUNDS as usize);
+    for _ in 0..ROUNDS {
+        let mut iters = 0u64;
+        let start = Instant::now();
+        while start.elapsed() < budget {
+            f();
+            iters += 1;
+        }
+        let secs = start.elapsed().as_secs_f64();
+        per_iter.push(secs / iters.max(1) as f64);
+    }
+    per_iter.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    per_iter[(per_iter.len() - 1) / 2]
+}
+
+/// 按终端显示宽度左对齐的基准输出行。
+fn bench_row(label: &str, value: String) -> String {
+    const LABEL_WIDTH: usize = 26;
+    let pad = LABEL_WIDTH.saturating_sub(display_width(label));
+    format!("  {}{}  {}", label, " ".repeat(pad), value)
+}
+
+/// 单个基准结果的度量值。
+enum Metric {
+    Throughput(f64),
+    Compression {
+        bytes_per_sec: f64,
+        ratio_percent: f64,
+    },
+    Ops(f64),
+}
+
+/// 一条基准结果（内部基准 `category` 为空，外部对比为分类名）。
+struct BenchResult {
+    name: String,
+    category: String,
+    metric: Metric,
+}
+
+/// 收集基准结果：非 JSON 模式即时打印人读行，JSON 模式末尾一次性输出。
+struct BenchReporter {
+    json: bool,
+    results: Vec<BenchResult>,
+}
+
+impl BenchReporter {
+    fn new(json: bool) -> Self {
+        Self {
+            json,
+            results: Vec::new(),
+        }
+    }
+
+    /// 报告一个以字节数计量的吞吐基准（如解压 / 校验 / AEAD）。
+    fn throughput(&mut self, label: &str, bytes_per_op: u64, budget: Duration, f: impl FnMut()) {
+        let per_iter = run_bench(budget, f);
+        let rate = if per_iter > 0.0 {
+            (bytes_per_op as f64 / per_iter) as u64
+        } else {
+            0
+        };
+        if !self.json {
+            println!("{}", bench_row(label, format!("{}/s", human_size(rate))));
+        }
+        self.results.push(BenchResult {
+            name: label.to_string(),
+            category: String::new(),
+            metric: Metric::Throughput(rate as f64),
+        });
+    }
+
+    /// 报告一个压缩基准：同时给出吞吐与压缩后占比。
+    fn compression(
+        &mut self,
+        label: &str,
+        input_len: u64,
+        output_len: u64,
+        budget: Duration,
+        f: impl FnMut(),
+    ) {
+        let per_iter = run_bench(budget, f);
+        let rate = if per_iter > 0.0 {
+            (input_len as f64 / per_iter) as u64
+        } else {
+            0
+        };
+        let ratio = if input_len > 0 {
+            output_len as f64 / input_len as f64 * 100.0
+        } else {
+            0.0
+        };
+        if !self.json {
+            println!(
+                "{}",
+                bench_row(
+                    label,
+                    format!("{}/s  压缩率 {ratio:.1}%", human_size(rate)),
+                )
+            );
+        }
+        self.results.push(BenchResult {
+            name: label.to_string(),
+            category: String::new(),
+            metric: Metric::Compression {
+                bytes_per_sec: rate as f64,
+                ratio_percent: ratio,
+            },
+        });
+    }
+
+    /// 报告一个以每秒操作数计量的基准（如 ML-KEM 各操作）。
+    fn ops(&mut self, label: &str, budget: Duration, f: impl FnMut()) {
+        let per_iter = run_bench(budget, f);
+        let rate = if per_iter > 0.0 { 1.0 / per_iter } else { 0.0 };
+        if !self.json {
+            println!("{}", bench_row(label, format!("{rate:.0} ops/s")));
+        }
+        self.results.push(BenchResult {
+            name: label.to_string(),
+            category: String::new(),
+            metric: Metric::Ops(rate),
+        });
+    }
+
+    /// 报告一条外部工具压缩结果。
+    fn external(
+        &mut self,
+        category: &str,
+        tool: &str,
+        in_len: usize,
+        out_len: usize,
+        elapsed: Duration,
+    ) {
+        let secs = elapsed.as_secs_f64();
+        let rate = if secs > 0.0 {
+            (in_len as f64 / secs) as u64
+        } else {
+            0
+        };
+        let ratio = if in_len > 0 {
+            out_len as f64 * 100.0 / in_len as f64
+        } else {
+            0.0
+        };
+        if !self.json {
+            println!(
+                "{}",
+                bench_row(tool, format!("{}/s  压缩到 {ratio:.1}%", human_size(rate)))
+            );
+        }
+        self.results.push(BenchResult {
+            name: tool.to_string(),
+            category: category.to_string(),
+            metric: Metric::Compression {
+                bytes_per_sec: rate as f64,
+                ratio_percent: ratio,
+            },
+        });
+    }
+
+    /// 是否处于 JSON 输出模式。
+    fn is_json(&self) -> bool {
+        self.json
+    }
+
+    /// 输出收集到的全部结果为单条 JSON（`--json` 模式在末尾调用一次）。
+    fn emit_json(&self, env: &BenchEnv) {
+        println!("{{");
+        println!(
+            "  \"version\": \"{}\",",
+            json_escape(env!("CARGO_PKG_VERSION"))
+        );
+        println!("  \"size_bytes\": {},", env.size_bytes);
+        println!("  \"budget_ms\": {},", env.budget_ms);
+        println!("  \"level\": {},", env.level);
+        println!("  \"processes\": {},", env.processes);
+        println!("  \"environment\": {{");
+        println!("    \"os\": \"{}\",", json_escape(&env.os));
+        println!("    \"arch\": \"{}\",", json_escape(&env.arch));
+        println!("    \"cores\": {},", env.cores);
+        println!("    \"cpu\": \"{}\"", json_escape(&env.cpu));
+        println!("  }},");
+        println!("  \"tools\": {{");
+        for (i, (name, ver)) in env.tools.iter().enumerate() {
+            let comma = if i + 1 < env.tools.len() { "," } else { "" };
+            match ver {
+                Some(v) => println!(
+                    "    \"{}\": \"{}\"{comma}",
+                    json_escape(name),
+                    json_escape(v)
+                ),
+                None => println!("    \"{}\": null{comma}", json_escape(name)),
+            }
+        }
+        println!("  }},");
+        println!("  \"results\": [");
+        for (i, r) in self.results.iter().enumerate() {
+            let comma = if i + 1 < self.results.len() { "," } else { "" };
+            match r.metric {
+                Metric::Throughput(bps) => println!(
+                    "    {{\"name\": \"{}\", \"category\": \"{}\", \"throughput_bytes_per_sec\": {}}}{comma}",
+                    json_escape(&r.name),
+                    json_escape(&r.category),
+                    bps
+                ),
+                Metric::Ops(ops) => println!(
+                    "    {{\"name\": \"{}\", \"category\": \"{}\", \"ops_per_sec\": {}}}{comma}",
+                    json_escape(&r.name),
+                    json_escape(&r.category),
+                    ops
+                ),
+                Metric::Compression {
+                    bytes_per_sec,
+                    ratio_percent,
+                } => println!(
+                    "    {{\"name\": \"{}\", \"category\": \"{}\", \"bytes_per_sec\": {}, \"ratio_percent\": {}}}{comma}",
+                    json_escape(&r.name),
+                    json_escape(&r.category),
+                    bytes_per_sec,
+                    ratio_percent
+                ),
+            }
+        }
+        println!("  ]");
+        println!("}}");
+    }
+}
+
+/// 一次基准运行的环境信息，用于 JSON 输出与跨机器复现。
+struct BenchEnv {
+    size_bytes: u64,
+    budget_ms: u64,
+    level: u8,
+    processes: usize,
+    cores: usize,
+    os: String,
+    arch: String,
+    cpu: String,
+    tools: Vec<(String, Option<String>)>,
+}
+
+/// JSON 字符串转义。
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// 检测外部工具是否可执行（只判断能否启动，忽略其退出码与输出）。
+fn tool_available(bin: &str, probe: &[&str]) -> bool {
+    Command::new(bin)
+        .args(probe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// 获取外部工具的版本号首行（供跨机器对比时记录环境）。
+fn tool_version(bin: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let src: &[u8] = if out.stdout.is_empty() {
+        &out.stderr
+    } else {
+        &out.stdout
+    };
+    Some(
+        String::from_utf8_lossy(src)
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())?
+            .to_string(),
+    )
+}
+
+/// 获取 CPU 型号字符串（尽力而为，取不到返回 None）。
+fn cpu_model() -> Option<String> {
+    if cfg!(target_os = "windows") {
+        return std::env::var("PROCESSOR_IDENTIFIER").ok();
+    }
+    let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    for line in info.lines() {
+        if let Some(v) = line.strip_prefix("model name") {
+            return v.split(':').nth(1).map(|s| s.trim().to_string());
+        }
+    }
+    None
+}
+
+/// 把基准数据写入临时文件，供外部工具按路径读取。
+fn write_temp_input(data: &[u8]) -> Option<PathBuf> {
+    let path = std::env::temp_dir().join(format!("rzp2-bench-{}.bin", std::process::id()));
+    std::fs::write(&path, data).ok()?;
+    Some(path)
+}
+
+/// 运行一个从文件读取、把压缩结果写到 stdout 的命令，返回 `(耗时, 输出字节数)`。
+fn run_capture(cmd: &mut Command) -> Option<(Duration, usize)> {
+    let start = Instant::now();
+    let output = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some((start.elapsed(), output.stdout.len()))
+}
+
+/// 把压缩级别映射为 7z 的 `-md` 字典大小（与 `lzma::preset` 一致）。
+fn seven_zip_dict(level: u8) -> String {
+    let dict = lzma::preset(level).dict_size as u64;
+    if dict % (1 << 20) == 0 {
+        format!("{}m", dict / (1 << 20))
+    } else {
+        format!("{}k", dict / 1024)
+    }
+}
+
+/// 7z 不支持把压缩结果写到 stdout，改为写入归档文件并返回耗时。
+/// 使用 LZMA1（`-m0=lzma`）并把字典对齐到与 `lzma::preset(level)` 相同的值；
+/// `-mmt=1` 固定单线程，与 RZP2 单线程 LZMA 公平对比。
+fn run_7z_compress(input: &Path, archive: &Path, level: u8) -> Option<Duration> {
+    let mx = format!("-mx={level}");
+    let md = format!("-md={}", seven_zip_dict(level));
+    let start = Instant::now();
+    let status = Command::new("7z")
+        .args(["a", "-bd", "-bso0", "-bsp0", "-t7z"])
+        .arg(&mx)
+        .arg("-m0=lzma")
+        .arg(&md)
+        .arg("-mmt=1")
+        .arg(archive)
+        .arg(input)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+    Some(start.elapsed())
+}
+
+/// 可用的外部压缩工具。
+struct ExternalTools {
+    xz: bool,
+    zstd: bool,
+    seven_zip: bool,
+}
+
+impl ExternalTools {
+    fn any(&self) -> bool {
+        self.xz || self.zstd || self.seven_zip
+    }
+}
+
+/// 检测外部压缩工具是否可用（只判断能否启动）。
+fn detect_external_tools() -> ExternalTools {
+    ExternalTools {
+        xz: tool_available("xz", &["--version"]),
+        zstd: tool_available("zstd", &["--version"]),
+        seven_zip: tool_available("7z", &[]),
+    }
+}
+
+/// 对一类数据做 RZP2 与外部工具（xz / zstd / 7z）的压缩吞吐与压缩比对比；
+/// 缺哪个就跳过哪个。LZMA 类工具统一对齐 `level`（及其对应字典）与 lc3-lp0-pb2，保证公平。
+fn external_compare(reporter: &mut BenchReporter, tools: &ExternalTools, name: &str, data: &[u8], level: u8) {
+    if !tools.any() {
+        return;
+    }
+
+    let Some(input) = write_temp_input(data) else {
+        return;
+    };
+    let archive = std::env::temp_dir().join(format!("rzp2-bench-{}.7z", std::process::id()));
+
+    if !reporter.is_json() {
+        println!();
+        println!(
+            "{}",
+            style::paint(name, style::Color::Bold, style::stdout_tty())
+        );
+    }
+
+    // RZP2 自身：与外部工具同表对比吞吐与压缩后占比。
+    let rzp2_params = lzma::preset(level);
+    let rzp2_start = Instant::now();
+    let rzp2_out = lzma::encode(data, &rzp2_params);
+    let rzp2_elapsed = rzp2_start.elapsed();
+    reporter.external(
+        name,
+        &format!("RZP2 LZMA (level {level})"),
+        data.len(),
+        rzp2_out.len(),
+        rzp2_elapsed,
+    );
+
+    if tools.xz {
+        let level_arg = format!("-{level}");
+        if let Some((elapsed, out_len)) = run_capture(
+            Command::new("xz")
+                .args([level_arg.as_str(), "--format=lzma", "-T1", "-c"])
+                .arg(&input),
+        ) {
+            reporter.external(
+                name,
+                &format!("xz (LZMA1, -{level})"),
+                data.len(),
+                out_len,
+                elapsed,
+            );
+        }
+    }
+    if tools.seven_zip {
+        let _ = std::fs::remove_file(&archive);
+        if let Some(elapsed) = run_7z_compress(&input, &archive, level) {
+            if let Ok(out_len) = std::fs::metadata(&archive).map(|m| m.len()) {
+                reporter.external(
+                    name,
+                    &format!("7z (LZMA1, -mx={level})"),
+                    data.len(),
+                    out_len as usize,
+                    elapsed,
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&archive);
+    }
+    if tools.zstd {
+        if let Some((elapsed, out_len)) =
+            run_capture(Command::new("zstd").args(["-q", "-T1", "-c"]).arg(&input))
+        {
+            reporter.external(name, "zstd (默认档，算法族不同)", data.len(), out_len, elapsed);
+        }
+    }
+
+    let _ = std::fs::remove_file(&input);
+}
+
+fn cmd_bench(o: &BenchOpts) -> i32 {
+    let budget = Duration::from_millis(o.budget_ms.unwrap_or(500));
+    let level = o.level.unwrap_or(lzma::DEFAULT_LEVEL);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let processes = o.processes.unwrap_or(cores);
+    let cpu = cpu_model().unwrap_or_else(|| "未知".into());
+    let data = bench_sample_data(o.size);
+    let params = lzma::preset(level);
+    let compressed = lzma::encode(&data, &params);
+    let mut reporter = BenchReporter::new(o.json);
+
+    if !o.json {
+        println!(
+            "{}",
+            style::paint("RZP2 性能基准", style::Color::Bold, style::stdout_tty())
+        );
+        println!(
+            "数据大小: {}，每项时间预算: {} ms，LZMA 级别: {}",
+            human_size(o.size as u64),
+            budget.as_millis(),
+            level
+        );
+        println!(
+            "环境: {} {}，逻辑核心数: {}，CPU: {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            cores,
+            cpu,
+        );
+        println!();
+    }
+
+    reporter.compression(
+        "LZMA 压缩",
+        o.size as u64,
+        compressed.len() as u64,
+        budget,
+        || {
+            let _ = lzma::encode(&data, &params);
+        },
+    );
+    reporter.throughput("LZMA 解压", o.size as u64, budget, || {
+        let _ = lzma::decode(&compressed).unwrap();
+    });
+
+    let lzma2_compressed = lzma::lzma2::encode(&data, &params, lzma::lzma2::DEFAULT_CHUNK_SIZE);
+    reporter.compression(
+        "LZMA2 压缩",
+        o.size as u64,
+        lzma2_compressed.len() as u64,
+        budget,
+        || {
+            let _ = lzma::lzma2::encode(&data, &params, lzma::lzma2::DEFAULT_CHUNK_SIZE);
+        },
+    );
+    reporter.throughput("LZMA2 解压", o.size as u64, budget, || {
+        let _ = lzma::lzma2::Decoder::new(params.dict_size as usize)
+            .decode(&lzma2_compressed)
+            .unwrap();
+    });
+
+    let lzma2_parallel =
+        lzma::lzma2::encode_parallel(&data, &params, lzma::lzma2::DEFAULT_CHUNK_SIZE, processes);
+    reporter.compression(
+        &format!("LZMA2 压缩（{processes} 进程）"),
+        o.size as u64,
+        lzma2_parallel.len() as u64,
+        budget,
+        || {
+            let _ = lzma::lzma2::encode_parallel(
+                &data,
+                &params,
+                lzma::lzma2::DEFAULT_CHUNK_SIZE,
+                processes,
+            );
+        },
+    );
+
+    // 校验和 / 哈希 / AEAD / KDF 原语。
+    reporter.throughput("SHAKE-256 校验和", o.size as u64, budget, || {
+        let _ = checksum(&data);
+    });
+    reporter.throughput("BLAKE2b（256 位）", o.size as u64, budget, || {
+        let _ = blake2b::blake2b(&data, 32);
+    });
+    let aead_key = [0x42u8; 32];
+    let aead_nonce = [0x24u8; 12];
+    reporter.throughput("AEAD 加密（ChaCha20-Poly1305）", o.size as u64, budget, || {
+        let _ = aead::aead_encrypt(&aead_key, &aead_nonce, &data, b"bench");
+    });
+    let pw = b"correct horse battery staple";
+    let salt = [0x11u8; 16];
+    reporter.ops("Argon2id 口令派生（默认参数）", budget, || {
+        let _ = derive_password_key(
+            pw,
+            &salt,
+            DEFAULT_MEMORY_KIB,
+            DEFAULT_ITERATIONS,
+            DEFAULT_LANES,
+        );
+    });
+
+    // ML-KEM 三个参数集。
+    for (name, p) in [
+        ("ML-KEM-512", mlkem::MLKEM512),
+        ("ML-KEM-768", mlkem::MLKEM768),
+        ("ML-KEM-1024", mlkem::MLKEM1024),
+    ] {
+        let (pk, sk) = mlkem::keygen(&p);
+        let (ct, _ss) = mlkem::encaps(&p, &pk);
+        reporter.ops(&format!("{name} 密钥生成"), budget, || {
+            let _ = mlkem::keygen(&p);
+        });
+        reporter.ops(&format!("{name} 封装"), budget, || {
+            let _ = mlkem::encaps(&p, &pk);
+        });
+        reporter.ops(&format!("{name} 解封装"), budget, || {
+            let _ = mlkem::decaps(&p, &sk, &ct);
+        });
+    }
+
+    // 单进程管线。
+    let plain = bench_config(Encryption::None, true);
+    let packed_plain = pack(&data, &plain).unwrap();
+    reporter.compression(
+        "管线打包（未加密）",
+        o.size as u64,
+        packed_plain.len() as u64,
+        budget,
+        || {
+            let _ = pack(&data, &plain).unwrap();
+        },
+    );
+    reporter.throughput("管线解包（未加密）", o.size as u64, budget, || {
+        let _ = unpack(&packed_plain, DecryptKey::None).unwrap();
+    });
+
+    let (pk2, sk2) = mlkem::keygen(&mlkem::MLKEM768);
+    let encrypted = bench_config(
+        Encryption::Kem {
+            kem: KemParams::MlKem768,
+            recipient_pk: &pk2,
+        },
+        true,
+    );
+    let packed_enc = pack(&data, &encrypted).unwrap();
+    reporter.compression(
+        "管线打包（加密）",
+        o.size as u64,
+        packed_enc.len() as u64,
+        budget,
+        || {
+            let _ = pack(&data, &encrypted).unwrap();
+        },
+    );
+    reporter.throughput("管线解包（加密）", o.size as u64, budget, || {
+        let _ = unpack(&packed_enc, DecryptKey::PrivateKey(&sk2)).unwrap();
+    });
+
+    // 分块并行管线（.rzp2 blocked 路径）：用较小分块确保真正多块并行。
+    if processes > 1 {
+        let mut par = bench_config(Encryption::None, true);
+        par.processes = processes;
+        par.block_size = (o.size / processes).max(1);
+        let packed_par = pack(&data, &par).unwrap();
+        reporter.compression(
+            &format!("管线打包（并行 {processes} 进程）"),
+            o.size as u64,
+            packed_par.len() as u64,
+            budget,
+            || {
+                let _ = pack(&data, &par).unwrap();
+            },
+        );
+        reporter.throughput("管线解包（分块载荷）", o.size as u64, budget, || {
+            let _ = unpack(&packed_par, DecryptKey::None).unwrap();
+        });
+    }
+
+    let tools = detect_external_tools();
+    let tool_versions: Vec<(String, Option<String>)> = [
+        ("xz", tools.xz, vec!["--version"]),
+        ("zstd", tools.zstd, vec!["--version"]),
+        ("7z", tools.seven_zip, vec!["i"]),
+    ]
+    .into_iter()
+    .filter(|(_, available, _)| *available)
+    .map(|(name, _, probe)| (name.to_string(), tool_version(name, &probe)))
+    .collect();
+
+    if tools.any() {
+        if !o.json {
+            println!();
+            println!(
+                "{}",
+                style::paint(
+                    &format!("外部压缩工具对比（LZMA 类对齐 level {level}，均单线程）"),
+                    style::Color::Bold,
+                    style::stdout_tty()
+                )
+            );
+            let mut parts = Vec::new();
+            for (name, ver) in &tool_versions {
+                match ver {
+                    Some(v) => parts.push(format!("{name} {v}")),
+                    None => parts.push(name.clone()),
+                }
+            }
+            if !parts.is_empty() {
+                println!("工具版本: {}", parts.join("，"));
+            }
+        }
+
+        external_compare(&mut reporter, &tools, "综合/混合", &data, level);
+
+        // 图片 / 视频 / 音频 / 纯文本：指定了文件则读取真实文件，否则退回内置合成数据。
+        let categories: [(&str, &Option<String>, fn(usize) -> Vec<u8>); 4] = [
+            ("图片", &o.image, bench_image_data),
+            ("视频", &o.video, bench_video_data),
+            ("音频", &o.audio, bench_audio_data),
+            ("纯文本", &o.text, bench_text_data),
+        ];
+        for (name, path, synth) in categories {
+            let d = match path {
+                Some(p) => match read_input(p) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("{}: {e}", err_prefix());
+                        return 1;
+                    }
+                },
+                None => synth(o.size),
+            };
+            external_compare(&mut reporter, &tools, name, &d, level);
+        }
+    }
+
+    if o.json {
+        reporter.emit_json(&BenchEnv {
+            size_bytes: o.size as u64,
+            budget_ms: budget.as_millis() as u64,
+            level,
+            processes,
+            cores,
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            cpu,
+            tools: tool_versions,
+        });
+    }
+
+    0
 }
 
 fn cmd_keygen(o: &KeygenOpts) -> i32 {
@@ -2428,7 +3618,7 @@ fn highlight_line(line: &str, tty: bool, opt_col: usize) -> String {
 }
 
 fn is_subcommand_line(trimmed: &str) -> bool {
-    const SUBS: [&str; 9] = [
+    const SUBS: [&str; 12] = [
         "compress",
         "decompress",
         "keygen",
@@ -2438,6 +3628,9 @@ fn is_subcommand_line(trimmed: &str) -> bool {
         "sfx",
         "split",
         "merge",
+        "bench",
+        "xz",
+        "unxz",
     ];
     SUBS.iter().any(|c| {
         trimmed
@@ -2504,6 +3697,9 @@ fn help_text() -> String {
   sfx <input> -o <output> [选项]        生成自解压可执行文件
   split <input> [选项]                  把文件切成多个分片
   merge <input> -o <output> [选项]      把分片合并回原文件
+  bench [选项]                          运行性能基准（吞吐 / 每秒操作数）
+  xz <input> -o <output> [选项]         压缩为 .xz（LZMA2）容器
+  unxz <input> -o <output> [选项]       解压 .xz 容器
 
 compress 选项:
   -o, --output <file>       输出文件（默认 <input>.rzp2；- 表示 stdout）
@@ -2517,7 +3713,7 @@ compress 选项:
       --checksum            附加未压缩明文 SHAKE-256 校验和
       --include <glob>      仅打包匹配的路径（可重复，仅目录归档）
       --exclude <glob>      排除匹配的路径（可重复，仅目录归档）
-      --threads <n>         并行压缩线程数（>1 启用分块压缩，默认 1）
+      --processes <n>         并行压缩进程数（>1 启用分块压缩，默认 1）
       --block-size <bytes>  分块压缩每块大小（默认 4 MiB）
       --dry-run             只打印将执行的动作，不实际读写
   -f, --force               覆盖已存在的输出文件
@@ -2560,6 +3756,31 @@ split 选项:
 
 merge 选项:
   -o, --output <file>       输出文件（默认取清单记录的原始文件名）
+      --dry-run             只打印将执行的动作，不实际读写
+  -f, --force               覆盖已存在的输出文件
+
+bench 选项:
+      --size <bytes>        基准数据大小（默认 1 MiB）
+      --processes <n>         并行 LZMA2 压缩进程数（默认按可用并行度）
+      --level <0-9>         LZMA 压缩级别（默认 5）
+      --budget <ms>         每项基准时间预算（默认 500 ms）
+      --json                以 JSON 输出全部结果
+      --image <file>        对比用图片数据（缺省用内置合成）
+      --video <file>        对比用视频数据（缺省用内置合成）
+      --audio <file>        对比用音频数据（缺省用内置合成）
+      --text <file>         对比用纯文本数据（缺省用内置合成）
+
+xz 选项:
+  -o, --output <file>       输出文件（默认 <input>.xz；- 表示 stdout）
+      --level <0-9>         压缩级别（默认 5）
+      --dict-size <bytes>   覆盖 LZMA2 字典大小
+      --block-size <bytes>  产出多块 .xz（每个 Block 的未压缩大小）
+      --processes <n>         多块并行压缩进程数（隐含多块）
+      --dry-run             只打印将执行的动作，不实际读写
+  -f, --force               覆盖已存在的输出文件
+
+unxz 选项:
+  -o, --output <file>       输出文件（默认去掉 .xz；- 表示 stdout）
       --dry-run             只打印将执行的动作，不实际读写
   -f, --force               覆盖已存在的输出文件
 
@@ -2669,20 +3890,20 @@ mod tests {
     }
 
     #[test]
-    fn compress_parses_threads_and_block_size() {
+    fn compress_parses_processes_and_block_size() {
         let a = args(&[
             "compress",
             "in.bin",
             "-o",
             "out.rzp2",
-            "--threads",
+            "--processes",
             "8",
             "--block-size",
             "1048576",
         ]);
         match parse(&a).unwrap() {
             Action::Compress(o) => {
-                assert_eq!(o.threads, 8);
+                assert_eq!(o.processes, 8);
                 assert_eq!(o.block_size, 1_048_576);
             }
             _ => panic!("wrong action"),
@@ -2741,6 +3962,121 @@ mod tests {
         let a = args(&["completion", "bash"]);
         match parse(&a).unwrap() {
             Action::Completion(o) => assert_eq!(o.shell.as_deref(), Some("bash")),
+            _ => panic!("wrong action"),
+        }
+    }
+
+    #[test]
+    fn bench_parse_default_and_size() {
+        let a = args(&["bench"]);
+        match parse(&a).unwrap() {
+            Action::Bench(o) => {
+                assert_eq!(o.size, 1 << 20);
+                assert_eq!(o.processes, None);
+                assert_eq!(o.image, None);
+                assert_eq!(o.video, None);
+                assert_eq!(o.audio, None);
+                assert_eq!(o.text, None);
+                assert_eq!(o.level, None);
+                assert_eq!(o.budget_ms, None);
+                assert!(!o.json);
+            }
+            _ => panic!("wrong action"),
+        }
+
+        let a = args(&["bench", "--size", "4194304"]);
+        match parse(&a).unwrap() {
+            Action::Bench(o) => assert_eq!(o.size, 4194304),
+            _ => panic!("wrong action"),
+        }
+
+        let a = args(&["bench", "--processes", "4"]);
+        match parse(&a).unwrap() {
+            Action::Bench(o) => assert_eq!(o.processes, Some(4)),
+            _ => panic!("wrong action"),
+        }
+
+        let a = args(&["bench", "--level", "7", "--budget", "1200", "--json"]);
+        match parse(&a).unwrap() {
+            Action::Bench(o) => {
+                assert_eq!(o.level, Some(7));
+                assert_eq!(o.budget_ms, Some(1200));
+                assert!(o.json);
+            }
+            _ => panic!("wrong action"),
+        }
+
+        let a = args(&[
+            "bench",
+            "--image",
+            "a.jpg",
+            "--video",
+            "b.mp4",
+            "--audio",
+            "c.wav",
+            "--text",
+            "d.txt",
+        ]);
+        match parse(&a).unwrap() {
+            Action::Bench(o) => {
+                assert_eq!(o.image.as_deref(), Some("a.jpg"));
+                assert_eq!(o.video.as_deref(), Some("b.mp4"));
+                assert_eq!(o.audio.as_deref(), Some("c.wav"));
+                assert_eq!(o.text.as_deref(), Some("d.txt"));
+            }
+            _ => panic!("wrong action"),
+        }
+    }
+
+    #[test]
+    fn xz_parse_default_output_and_options() {
+        let a = args(&["xz", "in.bin"]);
+        match parse(&a).unwrap() {
+            Action::Xz(o) => {
+                assert_eq!(o.input, "in.bin");
+                assert_eq!(o.output, "in.bin.xz");
+                assert_eq!(o.level, lzma::DEFAULT_LEVEL);
+            }
+            _ => panic!("wrong action"),
+        }
+
+        let a = args(&[
+            "xz",
+            "in.bin",
+            "-o",
+            "out.xz",
+            "--level",
+            "9",
+            "--dict-size",
+            "8388608",
+        ]);
+        match parse(&a).unwrap() {
+            Action::Xz(o) => {
+                assert_eq!(o.output, "out.xz");
+                assert_eq!(o.level, 9);
+                assert_eq!(o.dict_size, Some(8_388_608));
+            }
+            _ => panic!("wrong action"),
+        }
+
+        let a = args(&["xz", "in.bin", "--block-size", "65536", "--processes", "4"]);
+        match parse(&a).unwrap() {
+            Action::Xz(o) => {
+                assert_eq!(o.block_size, Some(65_536));
+                assert_eq!(o.processes, Some(4));
+            }
+            _ => panic!("wrong action"),
+        }
+    }
+
+    #[test]
+    fn unxz_parse_default_output() {
+        let a = args(&["unxz", "in.xz"]);
+        match parse(&a).unwrap() {
+            Action::Unxz(o) => {
+                assert_eq!(o.input, "in.xz");
+                assert_eq!(o.output, "in");
+            }
             _ => panic!("wrong action"),
         }
     }

@@ -151,8 +151,8 @@ pub struct PackConfig<'a> {
     pub archive: bool,
     /// 加密配置。
     pub encryption: Encryption<'a>,
-    /// 并行压缩线程数（>1 时使用分块 LZMA 载荷）。
-    pub threads: usize,
+    /// 并行压缩进程数（>1 时使用分块 LZMA 载荷）。
+    pub processes: usize,
     /// 分块并行压缩时每块的大小。
     pub block_size: usize,
 }
@@ -233,10 +233,10 @@ fn try_unwrap_dek(header: &Header, sk: &[u8]) -> Result<[u8; aead::KEY_SIZE], Pi
 
 /// 打包（压缩，可选加密）为完整 `.rzp2` 字节流。
 pub fn pack(plaintext: &[u8], config: &PackConfig) -> Result<Vec<u8>, PipelineError> {
-    // 1. 压缩（多线程时走分块 LZMA 载荷）。
-    let blocked = config.threads > 1;
+    // 1. 压缩（多进程时走分块 LZMA 载荷）。
+    let blocked = config.processes > 1;
     let compressed = if blocked {
-        lzma::encode_blocks(plaintext, &config.params, config.block_size, config.threads)
+        lzma::encode_blocks(plaintext, &config.params, config.block_size, config.processes)
     } else {
         lzma::encode(plaintext, &config.params)
     };
@@ -725,7 +725,7 @@ mod tests {
             add_checksum: true,
             archive: false,
             encryption,
-            threads: 1,
+            processes: 1,
             block_size: lzma::DEFAULT_BLOCK_SIZE,
         }
     }
@@ -909,7 +909,7 @@ mod tests {
     fn blocked_parallel_roundtrip() {
         let data = b"blocked parallel roundtrip".repeat(50_000);
         let mut c = config(Encryption::None);
-        c.threads = 4;
+        c.processes = 4;
         c.block_size = 256 * 1024;
         let packed = pack(&data, &c).unwrap();
         let (header, _) = Header::decode(&packed).unwrap();
@@ -925,7 +925,7 @@ mod tests {
             kem: KemParams::MlKem768,
             recipient_pk: &pk,
         });
-        c.threads = 3;
+        c.processes = 3;
         c.block_size = 256 * 1024;
         let packed = pack(&data, &c).unwrap();
         let (header, _) = Header::decode(&packed).unwrap();

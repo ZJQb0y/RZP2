@@ -13,7 +13,7 @@ fn config<'a>(encryption: Encryption<'a>, add_checksum: bool) -> PackConfig<'a> 
         add_checksum,
         archive: false,
         encryption,
-        threads: 1,
+        processes: 1,
         block_size: lzma::DEFAULT_BLOCK_SIZE,
     }
 }

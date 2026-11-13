@@ -1,12 +1,15 @@
 # RZP2 库 API
 
-RZP2 0.8.0 是一个从零自研的混合加密压缩库，库名 `rzp2`。核心算法全部手写实现，
+RZP2 0.12.0 是一个从零自研的混合加密压缩库，库名 `rzp2`。核心算法全部手写实现，
 零运行时第三方依赖（OS 随机源与密钥清零均从零实现）。
 
 ## 模块概览
 
 - `format`：容器格式定义与头部序列化 / 反序列化
-- `lzma`：LZMA 编解码器
+- `lzma`：LZMA / LZMA2 编解码器
+- `parallel`：多进程并行块编码（Unix fork / Windows spawn，崩溃隔离）
+- `xz`：`.xz` 容器读写（LZMA2 + CRC32）
+- `crc`：CRC32 / CRC64 校验（`.xz` 头与校验用）
 - `mlkem`：ML-KEM（FIPS 203）密钥封装
 - `aead`：ChaCha20-Poly1305 AEAD
 - `crypto`：BLAKE2b、Argon2、OS 随机源（`rand`）与密钥清零（`zeroize`）原语
@@ -90,6 +93,7 @@ pub enum FormatError {
 pub mod decoder;
 pub mod encoder;
 pub mod lz_encoder;
+pub mod lzma2;
 pub mod match_finder;
 pub mod prob_model;
 pub mod range_coder;
@@ -111,7 +115,69 @@ pub fn decode(input: &[u8]) -> Result<Vec<u8>, LzmaError>;
 
 输出采用 LZMA1「alone」格式：`properties(1) + dict_size(4, LE) + uncompressed_size(8, LE)`
 后接原始 LZMA 码流，与 LZMA SDK / xz 兼容。`preset(level)` 返回 `lc=3, lp=0, pb=2`
-的预设，字典大小随级别变化。
+的预设，字典大小随级别变化。`lzma::lzma2` 提供标准 LZMA2 分块编解码器，供 `xz` 容器使用。
+
+`lzma::lzma2`：
+
+```rust
+pub const DEFAULT_CHUNK_SIZE: usize; // 64 KiB
+
+pub fn encode(input: &[u8], params: &LzmaParams, chunk_size: usize) -> Vec<u8>;
+pub fn encode_parallel(input: &[u8], params: &LzmaParams, chunk_size: usize, processes: usize) -> Vec<u8>;
+pub struct Decoder;
+impl Decoder {
+    pub fn new(dict_size: usize) -> Self;
+    pub fn decode(self, input: &[u8]) -> Result<Vec<u8>, LzmaError>;
+}
+```
+
+`encode_parallel` 与 `encode` 输出逐字节一致，仅并行编码各块。
+
+## `parallel`
+
+```rust
+pub const WORKER_ARG: &str; // "__rzp2-worker"（Windows 内部隐藏子命令）
+
+pub enum Encoder { Lzma, Lzma2Chunk, Lzma2Stream }
+
+pub fn encode_blocks_parallel(
+    encoder: Encoder,
+    blocks: &[&[u8]],
+    params: &LzmaParams,
+    workers: usize,
+) -> Vec<Vec<u8>>;
+```
+
+多进程并行块编码：把互不依赖的块交给多个工作进程并行压缩，再按块序号回填。
+Unix（macOS / Linux）用 `fork` + 管道（子进程经写时复制共享只读输入，零序列化），
+Windows 用 `spawn` 复用本可执行文件的隐藏子命令经 stdin/stdout 传参；任一工作进程
+崩溃不会拖垮主进程，缺失块在当前进程串行补齐。`workers` 被钳制到 `1..=块数`。
+
+## `crc`
+
+```rust
+pub fn crc32(data: &[u8]) -> u32;
+pub fn crc64(data: &[u8]) -> u64;
+```
+
+CRC32（IEEE 802.3）与 CRC64（ECMA-182），查找表以 `OnceLock` 缓存。
+
+## `xz`
+
+```rust
+pub enum XzError {
+    Corrupt, Truncated, UnsupportedCheck(u8), UnsupportedFilter(u64), InvalidDictSize(u32), Lzma(LzmaError)
+}
+
+pub fn encode(input: &[u8], params: &LzmaParams) -> Result<Vec<u8>, XzError>;
+pub fn encode_blocks(input: &[u8], params: &LzmaParams, block_size: usize, processes: usize) -> Result<Vec<u8>, XzError>;
+pub fn decode(input: &[u8]) -> Result<Vec<u8>, XzError>;
+```
+
+读写标准 `.xz` 容器：单流、单个或多个 Block、LZMA2 过滤器、CRC32 / CRC64 / None 校验
+（编码使用 CRC32）。`encode` 写单块，`encode_blocks` 按 `block_size` 写多块并并行压缩；
+`decode` 统一解压单块 / 多块。`dict_size` 必须是合法的 LZMA2 值（`2^n` 或 `3 * 2^(n-1)`），
+否则返回 `XzError::InvalidDictSize`。
 
 ## `mlkem`
 
@@ -241,6 +307,8 @@ pub struct PackConfig<'a> {
     pub add_checksum: bool,
     pub archive: bool,
     pub encryption: Encryption<'a>,
+    pub processes: usize,   // >1 时使用分块 LZMA 载荷并行压缩
+    pub block_size: usize,  // 分块并行压缩的每块大小
 }
 
 pub enum DecryptKey<'a> { None, PrivateKey(&'a [u8]), Password(&'a [u8]) }

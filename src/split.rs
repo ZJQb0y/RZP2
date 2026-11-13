@@ -142,7 +142,7 @@ pub fn split_file(
     let chunk_count = if total_size == 0 {
         1
     } else {
-        ((total_size + chunk_size as u64 - 1) / chunk_size as u64) as u32
+        total_size.div_ceil(chunk_size as u64) as u32
     };
 
     // 先整体检查输出是否已存在，避免写一半才发现冲突。
@@ -197,16 +197,15 @@ pub fn merge_file(
     }
 
     let (prefix, manifest_path) = locate_manifest(input)?;
-    let mdata = fs::read(&manifest_path)
-        .map_err(|e| format!("读取清单 `{manifest_path}` 失败: {e}"))?;
+    let mdata =
+        fs::read(&manifest_path).map_err(|e| format!("读取清单 `{manifest_path}` 失败: {e}"))?;
     let manifest = decode_manifest(&mdata)?;
 
     let mut dst = File::create(output).map_err(|e| format!("创建 `{output}` 失败: {e}"))?;
     let mut done = 0u64;
     for i in 1..=manifest.chunk_count {
         let path = chunk_path(&prefix, i);
-        let data =
-            fs::read(&path).map_err(|e| format!("读取分片 `{path}` 失败: {e}"))?;
+        let data = fs::read(&path).map_err(|e| format!("读取分片 `{path}` 失败: {e}"))?;
         dst.write_all(&data)
             .map_err(|e| format!("写入 `{output}` 失败: {e}"))?;
         done += data.len() as u64;

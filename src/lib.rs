@@ -8,14 +8,17 @@
 pub mod aead;
 pub mod archive;
 pub mod cli;
-pub mod completion;
+pub mod crc;
 pub mod crypto;
 pub mod format;
 pub mod hybrid;
 pub mod keys;
 pub mod lzma;
 pub mod mlkem;
+pub mod parallel;
 pub mod pipeline;
 pub mod progress;
-pub mod sfx;
 pub mod split;
+pub mod xz;
+
+pub use cli::{completion, sfx};

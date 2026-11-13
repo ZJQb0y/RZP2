@@ -1,9 +1,10 @@
 # RZP2
 
 RZP2 是一个从零自研的混合加密压缩工具（第二代，与一代 RZP 不兼容）。
-当前版本：RZP2 0.8.0。
+当前版本：RZP2 0.12.0。
 
 - **压缩**：LZMA（LZ77 + 范围编码 + 自适应概率模型），码流与 LZMA SDK / xz 兼容
+- **LZMA2 + .xz**：`rzp2 xz` / `rzp2 unxz` 读写标准 `.xz`（LZMA2）容器，与系统 xz 互操作
 - **压缩级别**：`--level 0..=9`（`lc=3 lp=0 pb=2`，字典大小 64 KiB ～ 64 MiB）
 - **密钥封装**：ML-KEM（FIPS 203，即 Kyber）512/768/1024
 - **口令加密**：Argon2id（RFC 9106）派生对称密钥 + ChaCha20-Poly1305 AEAD
@@ -14,6 +15,7 @@ RZP2 是一个从零自研的混合加密压缩工具（第二代，与一代 RZ
 - **自解压（SFX）**：`rzp2 sfx` 生成自解压可执行文件（可选）
 - **进度条**：压缩 / 解压 / 分片 / 合并显示 `[===>   ]` 风格进度条（百分比 + 工作类型）
 - **分片 / 合并**：`rzp2 split` / `rzp2 merge` 把文件切成多片再按清单合并还原
+- **性能基准**：`rzp2 bench` 内置 LZMA / ML-KEM / 管线吞吐与每秒操作数基准，并对比 xz / zstd / 7z 压缩吞吐
 
 核心算法全部手写实现，零运行时第三方依赖（OS 随机源与密钥清零均从零实现），并通过官方测试向量验证。
 
@@ -58,6 +60,18 @@ rzp2 sfx docs.rzp2 -o docs.exe
 # 分片（默认每片 10 MiB，可用 --chunk-size 指定）与合并
 rzp2 split big.bin -o parts --chunk-size 1048576
 rzp2 merge parts.manifest -o big.bin
+
+# 性能基准（吞吐 / 每秒操作数；可用 --size 调整数据大小、--processes 固定进程数）
+rzp2 bench
+rzp2 bench --size 4194304 --processes 4 --level 6 --budget 200
+rzp2 bench --json --size 1048576 --level 9
+
+# 压缩为标准 .xz（LZMA2）容器 / 解压 .xz（与系统 xz 互操作）
+rzp2 xz input.txt -o output.xz --level 6
+rzp2 unxz output.xz -o restored.txt
+
+# 产出多块 .xz 并并行压缩（--block-size 指定每块未压缩大小，--processes 指定进程数）
+rzp2 xz big.bin -o big.xz --block-size 65536 --processes 4
 ```
 
 参数集 `<set>`：`mlkem512` / `mlkem768` / `mlkem1024`（默认 `mlkem768`）。
@@ -118,6 +132,12 @@ cargo test
 
 ```sh
 cargo +nightly bench
+```
+
+也可直接运行内置性能基准（无需 nightly）：
+
+```sh
+rzp2 bench
 ```
 
 ## 算法与安全说明

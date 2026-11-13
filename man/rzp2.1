@@ -1,4 +1,4 @@
-.TH RZP2 1 "2026-11-13" "rzp2 0.8.0" "用户命令"
+.TH RZP2 1 "2026-11-13" "rzp2 0.12.0" "用户命令"
 .SH 名称
 rzp2 \- 混合加密压缩工具（LZMA + ML-KEM + ChaCha20-Poly1305）
 .SH 语法
@@ -40,6 +40,15 @@ Argon2id 口令派生与 SHAKE-256 密钥派生。容器格式为
 .TP
 .B merge
 把分片按清单合并回原文件。
+.TP
+.B bench
+运行性能基准（吞吐 / 每秒操作数），并对比 xz / zstd / 7z 压缩吞吐。
+.TP
+.B xz
+压缩为标准 .xz（LZMA2）容器，与系统 xz 互操作。
+.TP
+.B unxz
+解压 .xz 容器。
 .TP
 .B completion
 生成 shell Tab 补全脚本。
@@ -159,6 +168,66 @@ ML-KEM 参数集（默认 mlkem768）。
 .TP
 .BR \-f ", " \-\-force
 覆盖已存在的输出文件。
+.SH bench 选项
+.TP
+.BR \-\-size " 字节"
+基准数据大小（默认 1 MiB）。
+.TP
+.BR \-\-processes " 进程数"
+并行 LZMA2 压缩进程数（默认按可用并行度）。跨机器对比时建议显式指定以保持一致。
+.TP
+.BR \-\-level " 级别"
+LZMA 压缩级别 0..=9（默认 5）。
+.TP
+.BR \-\-budget " 毫秒"
+每项基准的时间预算（默认 500 ms）。
+.TP
+.BR \-\-json
+以 JSON 格式输出全部基准结果（含环境与工具版本信息）。
+.TP
+.BR \-\-image " 文件"
+对比用图片数据；缺省用内置合成数据。
+.TP
+.BR \-\-video " 文件"
+对比用视频数据；缺省用内置合成数据。
+.TP
+.BR \-\-audio " 文件"
+对比用音频数据；缺省用内置合成数据。
+.TP
+.BR \-\-text " 文件"
+对比用纯文本数据；缺省用内置合成数据。
+.SH xz 选项
+.TP
+.BR \-o ", " \-\-output " 文件"
+输出文件（默认 <input>.xz；\- 表示 stdout）。
+.TP
+.BR \-\-level " 级别"
+压缩级别 0..=9（默认 5）。
+.TP
+.BR \-\-dict-size " 字节"
+覆盖 LZMA2 字典大小。
+.TP
+.BR \-\-block-size " 字节"
+产出多块 .xz（每个 Block 的未压缩大小）。
+.TP
+.BR \-\-processes " 进程数"
+多块并行压缩进程数（隐含多块）。
+.TP
+.BR \-\-dry-run
+只打印将执行的动作，不实际读写。
+.TP
+.BR \-f ", " \-\-force
+覆盖已存在的输出文件。
+.SH unxz 选项
+.TP
+.BR \-o ", " \-\-output " 文件"
+输出文件（默认去掉 .xz；\- 表示 stdout）。
+.TP
+.BR \-\-dry-run
+只打印将执行的动作，不实际读写。
+.TP
+.BR \-f ", " \-\-force
+覆盖已存在的输出文件。
 .SH 示例
 生成密钥对：
 .nf
@@ -202,6 +271,22 @@ ML-KEM 参数集（默认 mlkem768）。
 .nf
 \fBrzp2 split big.bin -o parts --chunk-size 1048576\fR
 \fBrzp2 merge parts.manifest -o big.bin\fR
+.fi
+运行性能基准：
+.nf
+\fBrzp2 bench\fR
+\fBrzp2 bench --size 4194304\fR
+\fBrzp2 bench --processes 4\fR
+\fBrzp2 bench --image photo.jpg --video clip.mp4\fR
+.fi
+压缩为 .xz 与解压 .xz：
+.nf
+\fBrzp2 xz input.txt -o output.xz --level 6\fR
+\fBrzp2 unxz output.xz -o restored.txt\fR
+.fi
+产出多块 .xz 并并行压缩：
+.nf
+\fBrzp2 xz big.bin -o big.xz --block-size 65536 --processes 4\fR
 .fi
 .SH 补全
 rzp2 内置 bash / zsh / fish / PowerShell 的 Tab 补全，可通过以下命令生成补全脚本：

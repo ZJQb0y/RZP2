@@ -26,10 +26,10 @@ pub fn render(shell: &str) -> Result<String, String> {
 /// 以及 `--params` / `--level` 的取值和文件型选项的路径。
 const BASH: &str = r#"# bash completion for rzp2
 
-_rzp2_subcommands="compress decompress keygen list test info sfx split merge help version"
+_rzp2_subcommands="compress decompress keygen list test info sfx split merge bench xz unxz help version"
 _rzp2_global_opts="-h --help -V --version"
 
-_rzp2_compress_opts="-o --output -e --encrypt --public-key --key --params --password --level --dict-size --checksum --include --exclude --threads --block-size --dry-run -h --help"
+_rzp2_compress_opts="-o --output -e --encrypt --public-key --key --params --password --level --dict-size --checksum --include --exclude --processes --block-size --dry-run -h --help"
 _rzp2_decompress_opts="-o --output --private-key --key --password --key-password --entry --dry-run -h --help"
 _rzp2_keygen_opts="--params --public --public-key --private --private-key --private-password -h --help"
 _rzp2_list_opts="--private-key --key --password --key-password -l --long --human-readable -h --help"
@@ -38,6 +38,9 @@ _rzp2_info_opts="-h --help"
 _rzp2_sfx_opts="-o --output -f --force -h --help"
 _rzp2_split_opts="-o --output --chunk-size --dry-run -f --force -h --help"
 _rzp2_merge_opts="-o --output --dry-run -f --force -h --help"
+_rzp2_bench_opts="--size -h --help"
+_rzp2_xz_opts="-o --output --level --dict-size --block-size --processes --dry-run -f --force -h --help"
+_rzp2_unxz_opts="-o --output --dry-run -f --force -h --help"
 
 _rzp2_is_file_opt() {
     case "$1" in
@@ -51,7 +54,7 @@ _rzp2_complete_opts() {
     case "$prev" in
         --params) COMPREPLY=( $(compgen -W "mlkem512 mlkem768 mlkem1024" -- "$cur") ); return ;;
         --level)  COMPREPLY=( $(compgen -W "0 1 2 3 4 5 6 7 8 9" -- "$cur") ); return ;;
-        --password|--key-password|--dict-size|--include|--exclude|--threads|--block-size|--entry|--chunk-size) COMPREPLY=(); return ;;
+        --password|--key-password|--dict-size|--include|--exclude|--processes|--block-size|--entry|--chunk-size) COMPREPLY=(); return ;;
     esac
     if _rzp2_is_file_opt "$prev"; then
         COMPREPLY=( $(compgen -f -- "$cur") )
@@ -88,6 +91,9 @@ _rzp2() {
         sfx)                _rzp2_complete_opts "$_rzp2_sfx_opts" ;;
         split)              _rzp2_complete_opts "$_rzp2_split_opts" ;;
         merge)              _rzp2_complete_opts "$_rzp2_merge_opts" ;;
+        bench)              _rzp2_complete_opts "$_rzp2_bench_opts" ;;
+        xz)                 _rzp2_complete_opts "$_rzp2_xz_opts" ;;
+        unxz)               _rzp2_complete_opts "$_rzp2_unxz_opts" ;;
         help|version)       COMPREPLY=() ;;
         "")
             COMPREPLY=( $(compgen -W "$_rzp2_subcommands $_rzp2_global_opts" -- "$cur") )
@@ -114,6 +120,9 @@ _rzp2() {
     'sfx:生成自解压可执行文件'
     'split:把文件切成多个分片'
     'merge:把分片合并回原文件'
+    'bench:运行性能基准（吞吐 / 每秒操作数）'
+    'xz:压缩为 .xz（LZMA2）容器'
+    'unxz:解压 .xz 容器'
     'help:显示帮助'
     'version:显示版本'
   )
@@ -146,7 +155,7 @@ _rzp2() {
             '--checksum[附加校验和]' \
             '--include[仅打包匹配路径]' \
             '--exclude[排除匹配路径]' \
-            '--threads[并行线程数]' \
+            '--processes[并行进程数]' \
             '--block-size[分块大小]' \
             '--dry-run[只打印将执行的动作]' \
             '(-h --help)'{-h,--help}'[显示帮助]'
@@ -215,6 +224,29 @@ _rzp2() {
             '(-f --force --overwrite)'{-f,--force,--overwrite}'[覆盖已存在的输出]' \
             '(-h --help)'{-h,--help}'[显示帮助]'
           ;;
+        bench)
+          _arguments \
+            '--size[基准数据大小]' \
+            '(-h --help)'{-h,--help}'[显示帮助]'
+          ;;
+        xz)
+          _arguments \
+            '(-o --output)'{-o,--output}'[输出文件]:文件:_files' \
+            '--level[压缩级别]:(0 1 2 3 4 5 6 7 8 9)' \
+            '--dict-size[LZMA2 字典大小]' \
+            '--block-size[产出多块 .xz，每个 Block 的未压缩大小]' \
+            '--processes[多块并行压缩进程数]' \
+            '--dry-run[只打印将执行的动作]' \
+            '(-f --force --overwrite)'{-f,--force,--overwrite}'[覆盖已存在的输出]' \
+            '(-h --help)'{-h,--help}'[显示帮助]'
+          ;;
+        unxz)
+          _arguments \
+            '(-o --output)'{-o,--output}'[输出文件]:文件:_files' \
+            '--dry-run[只打印将执行的动作]' \
+            '(-f --force --overwrite)'{-f,--force,--overwrite}'[覆盖已存在的输出]' \
+            '(-h --help)'{-h,--help}'[显示帮助]'
+          ;;
       esac
       ;;
   esac
@@ -239,6 +271,9 @@ complete -c rzp2 -n '__fish_use_subcommand' -a info -d '查看容器元信息'
 complete -c rzp2 -n '__fish_use_subcommand' -a sfx -d '生成自解压可执行文件'
 complete -c rzp2 -n '__fish_use_subcommand' -a split -d '把文件切成多个分片'
 complete -c rzp2 -n '__fish_use_subcommand' -a merge -d '把分片合并回原文件'
+complete -c rzp2 -n '__fish_use_subcommand' -a bench -d '运行性能基准（吞吐 / 每秒操作数）'
+complete -c rzp2 -n '__fish_use_subcommand' -a xz -d '压缩为 .xz（LZMA2）容器'
+complete -c rzp2 -n '__fish_use_subcommand' -a unxz -d '解压 .xz 容器'
 complete -c rzp2 -n '__fish_use_subcommand' -a help -d '显示帮助'
 complete -c rzp2 -n '__fish_use_subcommand' -a version -d '显示版本'
 
@@ -254,7 +289,7 @@ complete -c rzp2 -n '__fish_seen_subcommand_from compress c' -l dict-size -x -d 
 complete -c rzp2 -n '__fish_seen_subcommand_from compress c' -l checksum -d '附加校验和'
 complete -c rzp2 -n '__fish_seen_subcommand_from compress c' -l include -x -d '仅打包匹配路径'
 complete -c rzp2 -n '__fish_seen_subcommand_from compress c' -l exclude -x -d '排除匹配路径'
-complete -c rzp2 -n '__fish_seen_subcommand_from compress c' -l threads -x -d '并行线程数'
+complete -c rzp2 -n '__fish_seen_subcommand_from compress c' -l processes -x -d '并行进程数'
 complete -c rzp2 -n '__fish_seen_subcommand_from compress c' -l block-size -x -d '分块大小'
 complete -c rzp2 -n '__fish_seen_subcommand_from compress c' -l dry-run -d '只打印将执行的动作'
 complete -c rzp2 -n '__fish_seen_subcommand_from compress c' -s h -l help -d '显示帮助'
@@ -314,6 +349,26 @@ complete -c rzp2 -n '__fish_seen_subcommand_from merge' -s o -l output -r -d '�
 complete -c rzp2 -n '__fish_seen_subcommand_from merge' -l dry-run -d '只打印将执行的动作'
 complete -c rzp2 -n '__fish_seen_subcommand_from merge' -s f -l force -d '覆盖已存在的输出'
 complete -c rzp2 -n '__fish_seen_subcommand_from merge' -s h -l help -d '显示帮助'
+
+# bench
+complete -c rzp2 -n '__fish_seen_subcommand_from bench' -l size -x -d '基准数据大小'
+complete -c rzp2 -n '__fish_seen_subcommand_from bench' -s h -l help -d '显示帮助'
+
+# xz
+complete -c rzp2 -n '__fish_seen_subcommand_from xz' -s o -l output -r -d '输出文件'
+complete -c rzp2 -n '__fish_seen_subcommand_from xz' -l level -x -a '0 1 2 3 4 5 6 7 8 9' -d '压缩级别'
+complete -c rzp2 -n '__fish_seen_subcommand_from xz' -l dict-size -x -d 'LZMA2 字典大小'
+complete -c rzp2 -n '__fish_seen_subcommand_from xz' -l block-size -x -d '产出多块 .xz，每个 Block 的未压缩大小'
+complete -c rzp2 -n '__fish_seen_subcommand_from xz' -l processes -x -d '多块并行压缩进程数'
+complete -c rzp2 -n '__fish_seen_subcommand_from xz' -l dry-run -d '只打印将执行的动作'
+complete -c rzp2 -n '__fish_seen_subcommand_from xz' -s f -l force -d '覆盖已存在的输出'
+complete -c rzp2 -n '__fish_seen_subcommand_from xz' -s h -l help -d '显示帮助'
+
+# unxz
+complete -c rzp2 -n '__fish_seen_subcommand_from unxz' -s o -l output -r -d '输出文件'
+complete -c rzp2 -n '__fish_seen_subcommand_from unxz' -l dry-run -d '只打印将执行的动作'
+complete -c rzp2 -n '__fish_seen_subcommand_from unxz' -s f -l force -d '覆盖已存在的输出'
+complete -c rzp2 -n '__fish_seen_subcommand_from unxz' -s h -l help -d '显示帮助'
 "#;
 
 /// PowerShell 补全脚本（`Register-ArgumentCompleter`，兼容 Windows PowerShell 与 pwsh）。
@@ -337,13 +392,13 @@ function _rzp2_Files($prefix) {
 Register-ArgumentCompleter -Native -CommandName rzp2 -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
 
-    $subcommands = 'compress decompress keygen list test info sfx split merge help version'.Split(' ')
+    $subcommands = 'compress decompress keygen list test info sfx split merge bench xz unxz help version'.Split(' ')
     $globalOpts = @('-h', '--help', '-V', '--version')
     $fileOpts = @('-o', '--output', '--public-key', '--key', '--private-key', '--public', '--private')
 
     $optionSpecs = @{
-        'compress'   = '-o --output -e --encrypt --public-key --key --params --password --level --dict-size --checksum --include --exclude --threads --block-size --dry-run -h --help'
-        'c'          = '-o --output -e --encrypt --public-key --key --params --password --level --dict-size --checksum --include --exclude --threads --block-size --dry-run -h --help'
+        'compress'   = '-o --output -e --encrypt --public-key --key --params --password --level --dict-size --checksum --include --exclude --processes --block-size --dry-run -h --help'
+        'c'          = '-o --output -e --encrypt --public-key --key --params --password --level --dict-size --checksum --include --exclude --processes --block-size --dry-run -h --help'
         'decompress' = '-o --output --private-key --key --password --key-password --entry --dry-run -h --help'
         'd'          = '-o --output --private-key --key --password --key-password --entry --dry-run -h --help'
         'x'          = '-o --output --private-key --key --password --key-password --entry --dry-run -h --help'
@@ -358,6 +413,9 @@ Register-ArgumentCompleter -Native -CommandName rzp2 -ScriptBlock {
         'sfx'        = '-o --output -f --force -h --help'
         'split'      = '-o --output --chunk-size --dry-run -f --force -h --help'
         'merge'      = '-o --output --dry-run -f --force -h --help'
+        'bench'      = '--size -h --help'
+        'xz'         = '-o --output --level --dict-size --block-size --processes --dry-run -f --force -h --help'
+        'unxz'       = '-o --output --dry-run -f --force -h --help'
     }
 
     # 光标前已输入的 token；[0] 为命令名 rzp2，其余为参数。

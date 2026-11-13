@@ -185,6 +185,162 @@ impl LzDecoder {
         Ok(out)
     }
 
+    /// 续解码：在已有输出 `out`（须含完整历史字典）之上再解出 `expected_new` 字节，
+    /// 供 LZMA2 跨块续接使用。`state` 与 `reps` 为调用方持有的持久化 LZMA 状态，
+    /// 概率模型使用 `self.probs`（同样持久化）。
+    ///
+    /// `dict_size` 为字典大小上限，`dict_base` 为当前字典窗口在 `out` 中的起始下标
+    /// （用于拒绝越过字典重置边界的越界距离）。解码到 `expected_new` 字节或遇到
+    /// 结束标记为止。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_continue(
+        &mut self,
+        input: &[u8],
+        expected_new: usize,
+        dict_size: usize,
+        dict_base: usize,
+        out: &mut Vec<u8>,
+        state: &mut usize,
+        reps: &mut [u32; 4],
+    ) -> Result<(), LzmaError> {
+        let mut rc = RangeDecoder::new(input);
+        let target = out.len().saturating_add(expected_new);
+
+        let num_pos_states = self.layout.num_pos_states;
+        let pb_mask = num_pos_states - 1;
+        let lc = self.lc;
+        let lp = self.lp;
+
+        // 当前 LZMA 流内的相对位置。位置状态与字面量上下文都必须相对当前流（块）计算，
+        // 而不能使用输出缓冲区的绝对下标，否则跨块续解码时会与编码器产生偏移。
+        let mut local_pos = 0usize;
+
+        loop {
+            if out.len() >= target {
+                break;
+            }
+
+            let pos = out.len();
+            let ps = local_pos & pb_mask;
+            let layout = &self.layout;
+
+            // isMatch。
+            let is_match = layout.is_match_idx(*state, ps);
+            if rc.decode_bit(&mut self.probs[is_match]) == 0 {
+                // 字面量。
+                // 前一个字节必须相对当前流（块）判断：块首没有前一个字节，应视为 0，
+                // 而不能误取上一块末尾的字节。
+                let prev_byte = if local_pos > 0 { out[pos - 1] } else { 0 };
+                let ctx = layout.literal_context(local_pos, prev_byte, lc, lp);
+                let lit_base = layout.literal + ctx * LITERAL_SIZE;
+                let old_state = *state;
+                *state = literal_next_state(old_state);
+                let byte = if old_state < NUM_LIT_STATES {
+                    decode_bit_tree(&mut rc, &mut self.probs[lit_base..], 8) as u8
+                } else {
+                    let rep0 = reps[0] as usize;
+                    let match_byte = if pos >= rep0 && rep0 > 0 {
+                        out[pos - rep0]
+                    } else {
+                        0
+                    };
+                    decode_literal_matched(&mut rc, &mut self.probs[lit_base..], match_byte as u32)
+                        as u8
+                };
+                out.push(byte);
+                local_pos += 1;
+            } else if rc.decode_bit(&mut self.probs[layout.is_rep + *state]) == 0 {
+                // 普通匹配。
+                *state = match_next_state(*state);
+                let len_encoded =
+                    decode_length(&mut rc, &mut self.probs, layout.len_coder, ps) as usize;
+                let len = len_encoded + MATCH_MIN_LEN;
+                let d = decode_distance(&mut rc, &mut self.probs, layout, len_encoded);
+                if d == 0xFFFF_FFFF {
+                    // 结束标记。
+                    break;
+                }
+                let dist = (d + 1) as usize;
+                if dist > pos || dist > dict_size {
+                    return Err(LzmaError::CorruptData);
+                }
+                if pos - dist < dict_base {
+                    return Err(LzmaError::CorruptData);
+                }
+                reps[3] = reps[2];
+                reps[2] = reps[1];
+                reps[1] = reps[0];
+                reps[0] = dist as u32;
+                copy_match(out, dist, len);
+                local_pos += len;
+            } else {
+                // rep 匹配。
+                if rc.decode_bit(&mut self.probs[layout.is_rep_g0 + *state]) == 0 {
+                    // rep0。
+                    if rc.decode_bit(&mut self.probs[layout.is_rep0_long_idx(*state, ps)]) == 0 {
+                        // 短 rep（长度 1）。
+                        *state = short_rep_next_state(*state);
+                        let dist = reps[0] as usize;
+                        if dist > pos || dist > dict_size {
+                            return Err(LzmaError::CorruptData);
+                        }
+                        if pos - dist < dict_base {
+                            return Err(LzmaError::CorruptData);
+                        }
+                        copy_match(out, dist, 1);
+                        local_pos += 1;
+                        continue;
+                    }
+                    // rep0 长匹配：reps 不变。
+                } else {
+                    // 旋转 rep 距离。
+                    let rep_idx = if rc.decode_bit(&mut self.probs[layout.is_rep_g1 + *state]) == 0
+                    {
+                        1
+                    } else if rc.decode_bit(&mut self.probs[layout.is_rep_g2 + *state]) == 0 {
+                        2
+                    } else {
+                        3
+                    };
+                    let old = *reps;
+                    let dist = old[rep_idx];
+                    match rep_idx {
+                        1 => {
+                            reps[1] = old[0];
+                            reps[0] = dist;
+                        }
+                        2 => {
+                            reps[2] = old[1];
+                            reps[1] = old[0];
+                            reps[0] = dist;
+                        }
+                        _ => {
+                            reps[3] = old[2];
+                            reps[2] = old[1];
+                            reps[1] = old[0];
+                            reps[0] = dist;
+                        }
+                    }
+                }
+                *state = rep_next_state(*state);
+                let len_encoded =
+                    decode_length(&mut rc, &mut self.probs, layout.rep_len_coder, ps) as usize;
+                let len = len_encoded + MATCH_MIN_LEN;
+                let dist = reps[0] as usize;
+                if dist > pos || dist > dict_size {
+                    return Err(LzmaError::CorruptData);
+                }
+                if pos - dist < dict_base {
+                    return Err(LzmaError::CorruptData);
+                }
+                copy_match(out, dist, len);
+                local_pos += len;
+            }
+        }
+
+        Ok(())
+    }
+
     /// 流式解码：把解出的字节写入 `writer`，仅保留最近 `dict_size` 字节用于匹配回溯。
     ///
     /// 语义与 [`Self::decode`] 一致（`expected_size` 为已知长度时解到该长度即止，

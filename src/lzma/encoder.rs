@@ -60,6 +60,33 @@ pub fn encode(
     nice_len: usize,
     max_chain: usize,
 ) -> Vec<u8> {
+    encode_inner(input, lc, lp, pb, dict_size, nice_len, max_chain, true)
+}
+
+/// 编码已知长度的数据，返回原始 LZMA 码流（不含结束标记，供 LZMA2 分块使用）。
+pub fn encode_known_size(
+    input: &[u8],
+    lc: u32,
+    lp: u32,
+    pb: u32,
+    dict_size: usize,
+    nice_len: usize,
+    max_chain: usize,
+) -> Vec<u8> {
+    encode_inner(input, lc, lp, pb, dict_size, nice_len, max_chain, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_inner(
+    input: &[u8],
+    lc: u32,
+    lp: u32,
+    pb: u32,
+    dict_size: usize,
+    nice_len: usize,
+    max_chain: usize,
+    write_eos: bool,
+) -> Vec<u8> {
     let mut enc = LzEncoder::new(lc, lp, pb);
     let mut rc = RangeEncoder::new();
     let mut mf = HashChainMatchFinder::new(input.len(), dict_size, max_chain, nice_len);
@@ -105,7 +132,9 @@ pub fn encode(
         pos = new_pos;
     }
 
-    enc.encode_end_marker(&mut rc, pos);
+    if write_eos {
+        enc.encode_end_marker(&mut rc, pos);
+    }
     rc.finish()
 }
 

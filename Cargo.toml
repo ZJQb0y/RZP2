@@ -1,6 +1,6 @@
 [package]
 name = "rzp2"
-version = "0.8.0"
+version = "0.12.0"
 edition = "2021"
 description = "RZP2: LZMA + ML-KEM hybrid encrypted compression tool"
 license = "MIT OR Apache-2.0"
