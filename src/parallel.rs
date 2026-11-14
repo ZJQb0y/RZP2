@@ -1,7 +1,7 @@
-//! 多进程并行块编码。
+//! 多进程并行块编解码。
 //!
-//! 输入被切成互不依赖的块，交给多个工作进程并行压缩，再按块序号回填，从而把
-//! 「单进程多线程」的并行模型换成「多进程」：任一工作进程崩溃不会拖垮主进程。
+//! 输入被切成互不依赖的块，交给多个工作进程并行处理（压缩或解压），再按块序号回填，
+//! 从而把「单进程多线程」的并行模型换成「多进程」：任一工作进程崩溃不会拖垮主进程。
 //!
 //! - Unix（含 macOS/Linux）：`fork` + 管道。子进程经写时复制共享只读输入，零序列化。
 //! - Windows：`spawn` 复用本可执行文件（`WORKER_ARG` 子命令），经 stdin/stdout 传参。
@@ -9,7 +9,7 @@
 //! 保持零运行时第三方依赖：Unix 侧 `fork`/`pipe`/`poll`/`waitpid` 均以 `extern "C"`
 //! 直接声明，不引入 `libc`。
 
-use crate::lzma::{self, LzmaParams};
+use crate::lzma::{self, LzmaError, LzmaParams};
 
 /// Windows 工作进程的隐藏子命令标记（仅内部使用，不出现在帮助中）。
 pub const WORKER_ARG: &str = "__rzp2-worker";
@@ -25,22 +25,33 @@ pub enum Encoder {
     Lzma2Stream,
 }
 
-impl Encoder {
+/// 工作进程执行的作业类型。
+#[derive(Clone, Copy)]
+enum Job {
+    /// 编码一个块。
+    Encode(Encoder),
+    /// 解码一个完整 LZMA1 alone 流块。
+    Decode,
+}
+
+impl Job {
     #[cfg(windows)]
     fn kind_str(self) -> &'static str {
         match self {
-            Encoder::Lzma => "lzma",
-            Encoder::Lzma2Chunk => "lzma2-chunk",
-            Encoder::Lzma2Stream => "lzma2-stream",
+            Job::Encode(Encoder::Lzma) => "lzma",
+            Job::Encode(Encoder::Lzma2Chunk) => "lzma2-chunk",
+            Job::Encode(Encoder::Lzma2Stream) => "lzma2-stream",
+            Job::Decode => "lzma-decode",
         }
     }
 
     #[cfg(windows)]
     fn from_kind_str(s: &str) -> Option<Self> {
         match s {
-            "lzma" => Some(Encoder::Lzma),
-            "lzma2-chunk" => Some(Encoder::Lzma2Chunk),
-            "lzma2-stream" => Some(Encoder::Lzma2Stream),
+            "lzma" => Some(Job::Encode(Encoder::Lzma)),
+            "lzma2-chunk" => Some(Job::Encode(Encoder::Lzma2Chunk)),
+            "lzma2-stream" => Some(Job::Encode(Encoder::Lzma2Stream)),
+            "lzma-decode" => Some(Job::Decode),
             _ => None,
         }
     }
@@ -61,9 +72,43 @@ pub fn encode_blocks_parallel(
     }
     let workers = workers.clamp(1, n);
     if workers == 1 {
-        return (0..n).map(|i| encode_one(encoder, blocks[i], params)).collect();
+        return (0..n)
+            .map(|i| encode_one(encoder, blocks[i], params))
+            .collect();
     }
-    run_parallel(encoder, blocks, params, workers)
+    let slots = run_parallel(Job::Encode(encoder), blocks, params, workers);
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| s.unwrap_or_else(|| encode_one(encoder, blocks[i], params)))
+        .collect()
+}
+
+/// 用 `workers` 个工作进程并行解码 `blocks`（每个块为完整 LZMA1 alone 流），按块序号返回结果。
+///
+/// 任一工作进程崩溃或解码失败时，缺失 / 失败的块会在当前进程串行补齐；若串行解码
+/// 仍失败，则返回对应错误。
+pub fn decode_blocks_parallel(
+    blocks: &[&[u8]],
+    workers: usize,
+) -> Result<Vec<Vec<u8>>, LzmaError> {
+    let n = blocks.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let workers = workers.clamp(1, n);
+    if workers == 1 {
+        return blocks.iter().map(|b| lzma::decode(b)).collect();
+    }
+    let slots = run_parallel(Job::Decode, blocks, &LzmaParams::default(), workers);
+    let mut out = Vec::with_capacity(n);
+    for (i, s) in slots.into_iter().enumerate() {
+        match s {
+            Some(data) => out.push(data),
+            None => out.push(lzma::decode(blocks[i])?),
+        }
+    }
+    Ok(out)
 }
 
 /// 编码单个块。所有工作进程（fork 子进程 / spawn 工作进程）都调用此函数。
@@ -75,17 +120,25 @@ fn encode_one(encoder: Encoder, block: &[u8], params: &LzmaParams) -> Vec<u8> {
     }
 }
 
+/// 执行单个作业。解码失败时返回 `Err`，由工作进程转成「失败记录」回传。
+fn do_one(job: Job, block: &[u8], params: &LzmaParams) -> Result<Vec<u8>, LzmaError> {
+    match job {
+        Job::Encode(e) => Ok(encode_one(e, block, params)),
+        Job::Decode => lzma::decode(block),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unix：fork + 管道
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
 fn run_parallel(
-    encoder: Encoder,
+    job: Job,
     blocks: &[&[u8]],
     params: &LzmaParams,
     workers: usize,
-) -> Vec<Vec<u8>> {
+) -> Vec<Option<Vec<u8>>> {
     use unix::*;
 
     let n = blocks.len();
@@ -95,8 +148,14 @@ fn run_parallel(
     for _ in 0..workers {
         let mut fds = [0i32; 2];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
-            // 无法创建管道：退回串行。
-            return (0..n).map(|i| encode_one(encoder, blocks[i], params)).collect();
+            // 无法创建管道：退回串行（由调用方补齐）。
+            for fds in &pipes {
+                unsafe {
+                    close(fds[0]);
+                    close(fds[1]);
+                }
+            }
+            return vec![None; n];
         }
         pipes.push(fds);
     }
@@ -106,7 +165,7 @@ fn run_parallel(
     for w in 0..workers {
         let pid = unsafe { fork() };
         if pid < 0 {
-            // fork 失败：关闭父进程持有的所有 fd，回收已派生的子进程后退回串行。
+            // fork 失败：关闭父进程持有的所有 fd，回收已派生的子进程后返回，由调用方串行补齐。
             for fds in &pipes {
                 unsafe {
                     close(fds[0]);
@@ -119,7 +178,7 @@ fn run_parallel(
                     waitpid(pid, &mut status, 0);
                 }
             }
-            return (0..n).map(|i| encode_one(encoder, blocks[i], params)).collect();
+            return vec![None; n];
         }
         if pid == 0 {
             // 子进程：只保留自己的写端，其余 fd 全部关闭。
@@ -136,10 +195,13 @@ fn run_parallel(
             let write_fd = pipes[w][1];
             let mut i = w;
             while i < n {
-                let encoded = encode_one(encoder, blocks[i], params);
-                // 帧：index(u32 LE) + len(u32 LE) + data。
+                let (ok, data) = match do_one(job, blocks[i], params) {
+                    Ok(d) => (true, d),
+                    Err(_) => (false, Vec::new()),
+                };
+                // 帧：index(u32 LE) + ok(u8) + len(u32 LE) + data。
                 unsafe {
-                    write_record(write_fd, i as u32, &encoded);
+                    write_record(write_fd, i as u32, ok, &data);
                 }
                 i += workers;
             }
@@ -183,7 +245,7 @@ fn run_parallel(
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            break; // poll 出错：退回串行补齐缺失块。
+            break; // poll 出错：由调用方串行补齐缺失块。
         }
         for (k, pfd) in pfds.iter().enumerate() {
             if pfd.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL) == 0 {
@@ -191,8 +253,10 @@ fn run_parallel(
             }
             let w = fd_to_worker[k];
             match unsafe { read_record(pfd.fd) } {
-                Some((idx, data)) => {
-                    slots[idx as usize] = Some(data);
+                Some((idx, ok, data)) => {
+                    if ok {
+                        slots[idx as usize] = Some(data);
+                    }
                     collected += 1;
                 }
                 None => {
@@ -225,10 +289,7 @@ fn run_parallel(
         }
     }
 
-    // 5. 按块序号回填；个别子进程崩溃导致缺失的块在当前进程串行补齐。
-    (0..n)
-        .map(|i| slots[i].take().unwrap_or_else(|| encode_one(encoder, blocks[i], params)))
-        .collect()
+    slots
 }
 
 /// Unix 侧的最小 POSIX FFI（零依赖，不引入 libc）。
@@ -293,28 +354,35 @@ mod unix {
         true
     }
 
-    /// 写入一条结果记录 `(index, data)`。
-    pub unsafe fn write_record(fd: c_int, index: u32, data: &[u8]) {
-        let mut head = [0u8; 8];
+    /// 写入一条结果记录 `(index, ok, data)`。
+    pub unsafe fn write_record(fd: c_int, index: u32, ok: bool, data: &[u8]) {
+        let mut head = [0u8; 9];
         head[0..4].copy_from_slice(&index.to_le_bytes());
-        head[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        head[4] = ok as u8;
+        head[5..9].copy_from_slice(&(data.len() as u32).to_le_bytes());
         write_all_fd(fd, &head);
-        write_all_fd(fd, data);
+        if ok {
+            write_all_fd(fd, data);
+        }
     }
 
-    /// 读取一条结果记录 `(index, data)`。EOF / 出错返回 `None`。
-    pub unsafe fn read_record(fd: c_int) -> Option<(u32, Vec<u8>)> {
-        let mut head = [0u8; 8];
+    /// 读取一条结果记录 `(index, ok, data)`。EOF / 出错返回 `None`。
+    pub unsafe fn read_record(fd: c_int) -> Option<(u32, bool, Vec<u8>)> {
+        let mut head = [0u8; 9];
         if !read_exact_fd(fd, &mut head) {
             return None;
         }
         let index = u32::from_le_bytes(head[0..4].try_into().unwrap());
-        let len = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
+        let ok = head[4] != 0;
+        let len = u32::from_le_bytes(head[5..9].try_into().unwrap()) as usize;
+        if !ok {
+            return Some((index, false, Vec::new()));
+        }
         let mut data = vec![0u8; len];
         if !read_exact_fd(fd, &mut data) {
             return None;
         }
-        Some((index, data))
+        Some((index, true, data))
     }
 }
 
@@ -324,11 +392,11 @@ mod unix {
 
 #[cfg(windows)]
 fn run_parallel(
-    encoder: Encoder,
+    job: Job,
     blocks: &[&[u8]],
     params: &LzmaParams,
     workers: usize,
-) -> Vec<Vec<u8>> {
+) -> Vec<Option<Vec<u8>>> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
 
@@ -346,14 +414,14 @@ fn run_parallel(
 
     let exe = match std::env::current_exe() {
         Ok(e) => e,
-        Err(_) => return (0..n).map(|i| encode_one(encoder, blocks[i], params)).collect(),
+        Err(_) => return vec![None; n],
     };
 
     let mut children = Vec::with_capacity(workers);
     for _ in 0..workers {
         let mut cmd = Command::new(&exe);
         cmd.arg(WORKER_ARG)
-            .arg(encoder.kind_str())
+            .arg(job.kind_str())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -365,7 +433,7 @@ fn run_parallel(
                     let _ = c.kill();
                     let _ = c.wait();
                 }
-                return (0..n).map(|i| encode_one(encoder, blocks[i], params)).collect();
+                return vec![None; n];
             }
         }
     }
@@ -388,15 +456,17 @@ fn run_parallel(
     for w in 0..workers {
         let mut stdout = children[w].as_mut().unwrap().stdout.take().unwrap();
         for _ in 0..assigned[w].len() {
-            let (idx, len) = match (read_u32(&mut stdout), read_u32(&mut stdout)) {
-                (Some(i), Some(l)) => (i, l as usize),
+            let (idx, ok, len) = match (read_u32(&mut stdout), read_u8(&mut stdout), read_u32(&mut stdout)) {
+                (Some(i), Some(o), Some(l)) => (i, o, l as usize),
                 _ => break,
             };
-            let mut data = vec![0u8; len];
-            if stdout.read_exact(&mut data).is_err() {
-                break;
+            if ok != 0 {
+                let mut data = vec![0u8; len];
+                if stdout.read_exact(&mut data).is_err() {
+                    break;
+                }
+                slots[idx as usize] = Some(data);
             }
-            slots[idx as usize] = Some(data);
         }
     }
 
@@ -404,18 +474,16 @@ fn run_parallel(
         let _ = c.wait();
     }
 
-    (0..n)
-        .map(|i| slots[i].take().unwrap_or_else(|| encode_one(encoder, blocks[i], params)))
-        .collect()
+    slots
 }
 
-/// Windows 工作进程入口：从 stdin 读取任务，编码后写入 stdout。由 [`run_parallel`] 派生。
+/// Windows 工作进程入口：从 stdin 读取任务，处理后写入 stdout。由 [`run_parallel`] 派生。
 #[cfg(windows)]
 pub fn worker_main() -> i32 {
     use std::io::{Read, Write};
 
-    let encoder = match std::env::args().nth(2).as_deref().and_then(Encoder::from_kind_str) {
-        Some(e) => e,
+    let job = match std::env::args().nth(2).as_deref().and_then(Job::from_kind_str) {
+        Some(j) => j,
         None => return 2,
     };
 
@@ -446,10 +514,14 @@ pub fn worker_main() -> i32 {
         if r.read_exact(&mut block).is_err() {
             return 0;
         }
-        let encoded = encode_one(encoder, &block, &params);
+        let (ok, data) = match do_one(job, &block, &params) {
+            Ok(d) => (1u8, d),
+            Err(_) => (0u8, Vec::new()),
+        };
         if write_u32(&mut w, idx).is_err()
-            || write_u32(&mut w, encoded.len() as u32).is_err()
-            || w.write_all(&encoded).is_err()
+            || write_u8(&mut w, ok).is_err()
+            || write_u32(&mut w, data.len() as u32).is_err()
+            || (ok != 0 && w.write_all(&data).is_err())
         {
             return 1;
         }
@@ -464,10 +536,22 @@ fn write_u32(w: &mut impl std::io::Write, v: u32) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+fn write_u8(w: &mut impl std::io::Write, v: u8) -> std::io::Result<()> {
+    w.write_all(&[v])
+}
+
+#[cfg(windows)]
 fn read_u32(r: &mut impl std::io::Read) -> Option<u32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b).ok()?;
     Some(u32::from_le_bytes(b))
+}
+
+#[cfg(windows)]
+fn read_u8(r: &mut impl std::io::Read) -> Option<u8> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b).ok()?;
+    Some(b[0])
 }
 
 #[cfg(windows)]
@@ -504,12 +588,12 @@ fn read_params(r: &mut impl std::io::Read) -> Option<LzmaParams> {
 
 #[cfg(not(any(unix, windows)))]
 fn run_parallel(
-    encoder: Encoder,
+    job: Job,
     blocks: &[&[u8]],
     params: &LzmaParams,
     _workers: usize,
-) -> Vec<Vec<u8>> {
+) -> Vec<Option<Vec<u8>>> {
     (0..blocks.len())
-        .map(|i| encode_one(encoder, blocks[i], params))
+        .map(|i| do_one(job, blocks[i], params).ok())
         .collect()
 }

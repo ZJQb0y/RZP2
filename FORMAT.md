@@ -67,9 +67,12 @@ ChaCha20-Poly1305 密文 + 明文校验和」，并可选承载目录归档流�
   ```text
   count(1)
   对每个接收者:
-    kem(1) ek_len(2, LE) ek(..) wrapped_dek(48)
+    kem(1) ek_len(2, LE) ek(..) wrapped_dek(48) fingerprint(32)
   nonce(12)
   ```
+
+  `fingerprint` 为该接收者公钥的 SHAKE-256 指纹，仅在 `flags2.FINGERPRINT` 置位时
+  写入；旧格式（无 `FINGERPRINT`）读取端将其视为缺失（全零）。
 
   加密时生成随机 DEK 与基准 nonce，对每个接收者用其公钥封装得到共享密钥，
   再用派生密钥 AEAD 包裹 DEK（`wrapped_dek = 密文(32) + tag(16)`，AAD 绑定该接收者
@@ -151,6 +154,7 @@ ML-KEM 参数集编码：
 | --- | --- | --- |
 | 0 | `0b0000_0001` | 多接收者加密（`MULTI`，仅加密且非口令模式时合法） |
 | 1 | `0b0000_0010` | 载荷为分块 LZMA 帧序列（`BLOCKED`） |
+| 2 | `0b0000_0100` | 多接收者条目附带公钥指纹（`FINGERPRINT`，仅在 `MULTI` 时合法） |
 
 ## 头部序列化
 

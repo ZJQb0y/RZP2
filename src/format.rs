@@ -56,6 +56,9 @@ pub const DEK_WRAP_SIZE: usize = 48;
 /// 校验和（SHAKE-256）长度。
 pub const CHECKSUM_SIZE: usize = 32;
 
+/// 接收者公钥指纹（SHAKE-256）长度。
+pub const FINGERPRINT_SIZE: usize = 32;
+
 /// 口令加密盐长度（Argon2id）。
 pub const SALT_SIZE: usize = 16;
 
@@ -82,6 +85,8 @@ pub mod flag {
         pub const MULTI: u8 = 0b0000_0001;
         /// 载荷为分块 LZMA 帧序列（并行压缩，由长度前缀帧组成）。
         pub const BLOCKED: u8 = 0b0000_0010;
+        /// 多接收者条目附带了公钥指纹（`Recipient.fingerprint`）。
+        pub const FINGERPRINT: u8 = 0b0000_0100;
     }
 }
 
@@ -161,6 +166,8 @@ pub struct Recipient {
     pub ek: Vec<u8>,
     /// 用该接收者共享密钥包裹的 DEK（32 字节密文 + 16 字节标签）。
     pub wrapped_dek: [u8; DEK_WRAP_SIZE],
+    /// 该接收者公钥的 SHAKE-256 指纹（旧格式无指纹时为全零）。
+    pub fingerprint: [u8; FINGERPRINT_SIZE],
 }
 
 /// RZP2 文件头部（已解析）。
@@ -259,6 +266,7 @@ impl Header {
         let mut f = 0u8;
         if self.multi {
             f |= flag::ext::MULTI;
+            f |= flag::ext::FINGERPRINT;
         }
         if self.blocked {
             f |= flag::ext::BLOCKED;
@@ -293,6 +301,7 @@ impl Header {
                     out.extend_from_slice(&(r.ek.len() as u16).to_le_bytes());
                     out.extend_from_slice(&r.ek);
                     out.extend_from_slice(&r.wrapped_dek);
+                    out.extend_from_slice(&r.fingerprint);
                 }
                 out.extend_from_slice(&self.nonce);
             } else {
@@ -334,6 +343,7 @@ impl Header {
         let checksum = flags & flag::CHECKSUM != 0;
         let multi = flags2 & flag::ext::MULTI != 0;
         let blocked = flags2 & flag::ext::BLOCKED != 0;
+        let fingerprint = flags2 & flag::ext::FINGERPRINT != 0;
         let mut kem = KemParams::from_bits((flags & flag::KEM_MASK) >> flag::KEM_SHIFT)
             .ok_or(FormatError::BadKemParams)?;
 
@@ -347,6 +357,10 @@ impl Header {
         }
         // 多接收者仅在 v3+ 的 ML-KEM 加密模式下有意义。
         if multi && (!encrypted || password || version < 3) {
+            return Err(FormatError::BadFlags);
+        }
+        // 公钥指纹仅作为多接收者条目的附加字段出现。
+        if fingerprint && (!multi || version < 3) {
             return Err(FormatError::BadFlags);
         }
         // 分块帧载荷仅在 v3+ 有意义。
@@ -402,14 +416,23 @@ impl Header {
                         return Err(FormatError::Truncated);
                     }
                     let mut wrapped_dek = [0u8; DEK_WRAP_SIZE];
+                    let mut rfingerprint = [0u8; FINGERPRINT_SIZE];
                     let rek = buf[offset..offset + ek_len].to_vec();
                     offset += ek_len;
                     wrapped_dek.copy_from_slice(&buf[offset..offset + DEK_WRAP_SIZE]);
                     offset += DEK_WRAP_SIZE;
+                    if fingerprint {
+                        if buf.len() < offset + FINGERPRINT_SIZE {
+                            return Err(FormatError::Truncated);
+                        }
+                        rfingerprint.copy_from_slice(&buf[offset..offset + FINGERPRINT_SIZE]);
+                        offset += FINGERPRINT_SIZE;
+                    }
                     recipients.push(Recipient {
                         kem: rkem,
                         ek: rek,
                         wrapped_dek,
+                        fingerprint: rfingerprint,
                     });
                 }
                 if buf.len() < offset + NONCE_SIZE {
@@ -591,11 +614,13 @@ mod tests {
                 kem: KemParams::MlKem512,
                 ek: vec![1, 2, 3],
                 wrapped_dek: [1u8; DEK_WRAP_SIZE],
+                fingerprint: [0xa1u8; FINGERPRINT_SIZE],
             },
             Recipient {
                 kem: KemParams::MlKem1024,
                 ek: vec![4, 5, 6, 7],
                 wrapped_dek: [2u8; DEK_WRAP_SIZE],
+                fingerprint: [0xb2u8; FINGERPRINT_SIZE],
             },
         ];
         let enc = h.encode();
@@ -606,6 +631,7 @@ mod tests {
         assert_eq!(dec.kem, KemParams::MlKem512);
         assert_eq!(dec.recipients[1].ek, vec![4, 5, 6, 7]);
         assert_eq!(dec.recipients[1].wrapped_dek, [2u8; DEK_WRAP_SIZE]);
+        assert_eq!(dec.recipients[1].fingerprint, [0xb2u8; FINGERPRINT_SIZE]);
         assert_eq!(dec.nonce, [5u8; NONCE_SIZE]);
     }
 

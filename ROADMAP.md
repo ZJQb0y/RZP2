@@ -1,172 +1,101 @@
 # RZP2 路线图
 
-> 本文档记录 RZP2 后续可升级方向。每一项都标注了「现状」与「目标」，供按优先级排期。
-> 当前版本：0.12.0（见 [CHANGELOG.md](CHANGELOG.md)）。
+本文记录 RZP2 的演进方向与计划。目标始终是：**保持零运行时第三方依赖、核心算法
+手写且逐行可审计**，在此基础上补齐能力与性能短板。
 
-优先级约定：
+优先级标记：
 
-- **P0**：近期、高价值、影响核心使用
-- **P1**：中期、显著提升
-- **P2**：长期 / 探索性
+- **P0**：近期（下一个/下两个小版本）优先落地，收益直接、改动可控。
+- **P1**：中期，方向明确，需要较大改动或格式扩展。
+- **P2**：长期/探索，涉及格式升级或较重的工程投入。
 
----
+## 已完成（≤ 0.13）
 
-## 1. 流式与内存占用（P0）
+- LZMA / LZMA2 编解码，`.rzp2`（v3，兼容读 v1/v2）与 `.xz`（LZMA2 + CRC32）容器。
+- ML-KEM 512/768/1024、ChaCha20-Poly1305、Argon2id、SHAKE-256、BLAKE2b。
+- 多接收者加密（随机 DEK + 逐接收者封装）、分块 AEAD（v3 `CHUNKED`）、分块 LZMA（`BLOCKED`）。
+- 目录归档、自解压（SFX）、文件分片/合并、shell 补全、性能基准（`bench`）。
+- 多进程并行块编码（Unix `fork` / Windows `spawn`，崩溃隔离，缺失块串行补齐）。
+- 并行解压（`decode_blocks_parallel`，复用多进程模型，崩溃/失败回退串行补齐）。
+- 流式压缩 + 明文校验和（未加密文件输出经 seek 回写头部，stdin/加密回退缓冲式打包）。
+- `--processes` 默认按可用 CPU 核数自动检测（`compress` / `decompress` / `xz`）。
+- 多接收者公钥指纹（`Recipient.fingerprint`，v3 `flags2` 扩展标志，解密按指纹快速定位，`info` 展示）。
 
-**现状**：压缩侧已打通流式管线。[pipeline.rs](src/pipeline.rs) 的 `pack_to_writer` 与
-[lzma](src/lzma/mod.rs) 的 `encode_stream` 支持 `Read` / `Write` 边读边处理，加密时经
-`ChunkedWriter` 分块落盘；解压侧 `unpack_to_writer` 已知 `original_size` 时流式写出。
-剩余缺口：归档解包仍整包 `decode_archive` 到内存；校验和路径因头部需先写明文摘要仍走缓冲。
+## P0 — 近期（0.13 / 0.14）
 
-**方向**：
+> 本批次 P0 已完成，见上方「已完成」。保留本节标题以维持 P1/P2 编号稳定。
 
-- [x] 引入 `Read` / `Write` 流式接口，`compress` / `decompress` 边读边处理，而非整体载入内存。
-- [x] 解压时已知 `original_size` 走流式写出，避免一次性构造明文。
-- [x] 归档解包按条目流式落盘，避免整包 `decode_archive` 到内存。
-- [ ] 为流式路径设置内存上限（尤其是 Argon2id 的 `memory_kib` 显式可控）。
+## P1 — 中期（0.15+）
 
----
+### 5. 压缩率提升：更强匹配查找 / 二进制过滤器
 
-## 2. 性能（P0 / P1）
+- **现状**：LZMA 匹配器为哈希链 + 延迟匹配，级别自适应深度/停断（见
+  [src/lzma/lz_encoder.rs](src/lzma/lz_encoder.rs)）。
+- **方案**：
+  - 增加 BT4/二叉树匹配查找或更优解析，提升高压缩级别压缩率。
+  - 增加 BCJ/Delta 过滤器（x86/ARM/通用二进制数据），在压缩前做可逆变换。
+- **影响**：`lzma`（`match_finder` / `lz_encoder`）、新增过滤器模块。
+- **收益**：接近 xz 高等级压缩率，缩小与系统 xz 的差距。
 
-### 2.1 SIMD 加速加密原语（P0）
+### 6. 自解压（SFX）能力增强
 
-**现状**：ChaCha20 已有 AVX2 快路径；Poly1305、BLAKE2b、Argon2 仍为标量实现。
+- **现状**：ML-KEM 公钥加密容器无法通过 SFX 解压（存根内不能安全携带私钥），
+  需改走 `decompress --private-key`。
+- **方案**：支持 SFX 运行时指定私钥文件路径（`--private-key`）或环境变量；口令加密
+  容器支持从环境变量非交互读口令。
+- **影响**：`cli::sfx`、运行时自检测逻辑。
+- **收益**：加密 SFX 分发场景可用性提升。
 
-- [x] ChaCha20 加 AVX2 快路径（运行时检测 + 纯标量兜底）。
-- [x] ChaCha20 补 NEON 快路径（保持零依赖，用 `core::arch` 内在函数）。
-- [x] Poly1305 补 NEON 快路径（保持零依赖，用 `core::arch` 内在函数）。
-- [ ] BLAKE2b 的压缩轮与 Argon2 的 BLAKE2b 轮做向量化。
-- [x] 用 `#[cfg(target_feature)]` + 运行时/编译期选择，保留纯标量兜底。
+### 7. Argon2id 参数自适应与私钥口令封装规范化
 
-### 2.2 LZMA 编码器（P1）
+- **现状**：口令加密默认 `64 MiB / 3 次 / 4 lanes`，参数固定；私钥口令加密为自有
+  PEM + 口令形式。
+- **方案**：
+  - 提供 `--password-memory/--password-iters` 或「auto」档位，按机器性能自适应调参。
+  - 评估 PKCS#8 兼容的私钥封装（EncryptedPrivateKeyInfo），提升跨工具互操作。
+- **影响**：`hybrid`、`crypto::argon2`、`keys`。
+- **收益**：口令加密强度可调、密钥文件更标准。
 
-**现状**：`match_finder` 为哈希链匹配，单线程；`encoder` 无最优解析。
+### 8. 容器统一到 LZMA2（可选）
 
-- [ ] 匹配查找器升级（BT4 或更高质量），提升高压缩级别压缩率。
-- [x] 增加最优解析 / 延迟匹配选项，改善 `--level 7..=9` 的压缩率。
-- [x] 分块并行压缩：大输入切块多进程压缩后拼接（需配套容器格式改动，见 §4）。
-- [x] 暴露 `--processes` 控制并行进程数。
+- **现状**：`.rzp2` 主容器载荷用 LZMA1 alone 流（分块时多 alone 流），`.xz` 才用
+  LZMA2。两套并存。
+- **方案**：评估让 `.rzp2` 载荷也采用 LZMA2 分块，获得更好的分块/流式/随机访问；
+  需要新增格式版本或扩展标志，保持旧版本读取兼容。
+- **影响**：`format`（版本策略）、`lzma::lzma2`、`pipeline`。
+- **收益**：简化内核、统一编解码路径；属较大的格式变更，需谨慎排期。
 
-### 2.3 基准与回归（P1）
+## P2 — 长期 / 探索
 
-- [ ] 建立可复现的性能基准集（文本 / 二进制 / 已压缩 / 高度重复）。
-- [ ] CI 加入 `cargo bench`（nightly）或独立 benchmark 工作流，跟踪性能回退。
+### 9. SIMD 扩展到压缩内核
 
----
+- **现状**：SIMD 仅用于 ChaCha20（AVX2/NEON）与 Poly1305（NEON）。
+- **方向**：范围编码器 / 匹配查找 / CRC 的 SIMD 加速，按运行时特性检测 + 标量兜底。
+- **影响**：`lzma::range_coder`、`lzma::match_finder`、`crc`。
+- **收益**：进一步压缩/解压吞吐提升。
 
-## 3. 安全与密码学（P0 / P1）
+### 10. 内存保护与密钥管理增强
 
-### 3.1 私钥保护（P0）
+- **方向**：关键密钥内存 `mlock`（防换出）、更严格的 `Zeroize` 覆盖、`#[zeroize_on_drop]`
+  语义核对；评估恒定时间 AES 之外的旁路缓解。
+- **影响**：`crypto::zeroize`、`aead`、`hybrid`、`pipeline`。
+- **收益**：提升密钥在内存中的安全性。
 
-**现状**：私钥默认以明文 PEM 存储（[keys.rs](src/keys.rs)），现支持口令加密私钥。
+### 11. 测试与质量持续投入
 
-- [x] 支持口令加密私钥（Argon2id 派生密钥加密私钥 payload，PEM 风格 + 加密标记）。
-- [x] `keygen` 提供 `--private-password` 选项；解密时从 stdin / `--key-password` 读取口令。
-- [x] 校验并加固私钥文件写入权限（Unix 下默认 `0600`）。
+- 引入 `cargo-fuzz` / proptest / 差分 fuzz（与系统 `xz`、Python `lzma` 交叉验证）。
+- CI 增加 fuzz 冒烟与 `bench` 回归门禁。
+- 补充更多跨实现测试向量与损坏/截断/恶意输入用例。
 
-### 3.2 侧信道与常量时间（P1）
+### 12. 打包与发布自动化
 
-- [x] 审查并补全所有密钥相关路径的常量时间实现（Poly1305 比较、ML-KEM 采样与 decaps 分支）。
-- [ ] ML-KEM 侧信道防护（掩码 / 打乱），降低旁路攻击面。
-- [ ] 引入 dudect / ctgrind 类工具做常量时间回归测试。
+- CI 自动构建三平台 release 产物并签名、上传 GitHub Release。
+- 增加 SBOM 生成、musl 静态构建、Homebrew/scoop 自动更新管线。
+- 发布前跑 `cargo deny`、`cargo audit`、`cargo fmt --check` 与 `clippy -D warnings`。
 
-### 3.3 密码学可配置性（P2）
+## 持续原则
 
-- [ ] 可选 AEAD 算法（如 XChaCha20-Poly1305、AES-GCM），通过 feature flag 或容器字段选择。
-- [ ] 口令模式支持 Argon2id 参数上限校验，防止恶意容器用超大 `memory_kib` 造成 DoS。
-- [ ] 引入算法敏捷性字段，为未来密码学升级留出升级路径（不破坏兼容）。
-
-### 3.4 审计（P1）
-
-- [ ] 寻求第三方安全审计（格式、原语、KEM 组合、解析器健壮性）。
-- [ ] 发布安全策略（SECURITY.md）与负责任披露流程。
-
----
-
-## 4. 容器格式演进（P1 / P2）
-
-**现状**：v3 已支持分块 AEAD（`CHUNKED` 标志 + `ChunkedWriter`），加密载荷逐块认证；
-压缩侧已支持多进程并行，解压仍为单进程，尚未支持可追加条目。
-
-- [x] v3：分块 / 分帧布局（已支持逐块 AEAD 认证）。
-  - [x] 逐块校验（单块损坏导致所在帧认证失败，可定位到帧）。
-  - [ ] 多进程并行解压（压缩侧已并行，见 §2.2）。
-  - [ ] 可追加条目（增量归档）。
-- [x] 每块独立 AEAD tag 与 nonce 派生，避免整包单一 nonce。
-- [x] 保留 v1 / v2 读取兼容，v3 通过版本号渐进升级。
-- [ ] 扩展头部字段为 TLV，便于未来扩展而不破坏解析。
-
----
-
-## 5. CLI 与功能（P0 / P1）
-
-**现状**：子命令 `compress` / `decompress` / `keygen` / `list` / `test` / `info` / `completion` / `xz` / `unxz`
-已就绪，但缺少大量实用选项（[cli.rs](src/cli.rs) 手写解析）。
-
-- [x] `--force` / `--overwrite`：覆盖已存在输出文件。
-- [x] 自解压（SFX）：`rzp2 sfx` 生成自解压可执行文件（把 `rzp2` 自身作为存根追加 `.rzp2` 载荷，可选）。
-- [ ] `--keep`：保留源文件。
-- [x] `--dry-run`：只打印将执行的动作。
-- [x] 详细进度条：压缩 / 解压 / 分片 / 合并显示 `[===>]` 风格进度条（百分比 + 工作类型）。
-- [x] 多接收者加密：`--public-key` 支持重复指定多个公钥（多接收者 KEM）。
-- [x] 口令交互式输入（无回显）与二次确认，替代明文 `--password` 的易泄露场景。
-- [x] `list` 增强：显示 `-lh` 式人可读大小、mtime、权限、符号链接目标。
-- [x] 归档过滤器：`--include` / `--exclude`（glob），选择性打包。
-- [x] `decompress` 支持从归档中抽取单个条目到 stdout（`-o -` 单文件抽取）。
-- [x] 文件分片 / 合并：`split` / `merge` 子命令（自研分片清单）。
-- [x] 性能基准：`bench` 子命令（内置吞吐 / 每秒操作数基准，并对比 xz / zstd / 7z）。
-- [x] LZMA2 / .xz 互操作：`xz` / `unxz` 子命令（标准 .xz 单/多块 LZMA2 + CRC32，`--block-size` / `--processes` 产出多块，与系统 xz 互操作）。
-
----
-
-## 6. 测试与工程化（P1）
-
-**现状**：单元测试覆盖原语与管线，含模糊测试与 xz 交叉验证；CI 仅做三平台 build/test/clippy/fmt
-（[ci.yml](.github/workflows/ci.yml)）。`deny.toml` 已配置但未接入 CI。
-
-- [ ] CI 接入 `cargo deny check`（advisories / licenses / bans）。
-- [ ] CI 增加持续模糊测试（`cargo fuzz` 短跑）与 `cargo-careful` / Miri 检查。
-- [ ] CI 增加 sanitizer（ASan / MSan）构建与常量时间回归。
-- [ ] 建立最低支持 Rust 版本（MSRV）并在 CI 校验。
-- [ ] 代码覆盖率（cargo-llvm-cov）并设定最低门槛。
-- [ ] 属性测试（proptest）补充 LZMA / 归档 / 头部编解码的边界。
-
----
-
-## 7. 打包与分发（P1 / P2）
-
-**现状**：deb / rpm / Arch / AUR / Homebrew / Scoop / NSIS / 可移植 zip 已覆盖（[Cargo.toml](Cargo.toml)、
-[package.sh](package.sh)、[package.ps1](package.ps1)）。
-
-- [ ] 发布到 crates.io，支持 `cargo install rzp2`。
-- [ ] Flatpak / winget / Chocolatey 分发。
-- [ ] 交叉编译产物加入 musl 静态链接（Linux 免 glibc 版本差异）。
-- [ ] 为发布产物附 SHA-256 校验和与签名（minisign / Sigstore）。
-- [ ] CI 自动化发布（tag 触发，上传多平台产物与校验和）。
-
----
-
-## 8. 图形界面与生态集成（P2）
-
-- [ ] 可选 TUI（如终端进度 + 交互式选择）与 GUI 前端（桌面端可视化压缩 / 解压 / 密钥管理）。
-- [ ] 扩展文件管理器集成（除 Nautilus 外，补充 KDE Dolphin、Windows 资源管理器右键菜单）。
-- [ ] 与 `tar` / `xz` 生态更深入互操作（.xz 单/多块 LZMA2 已支持，剩余：真正的流式 xz 读写、支持 `.tar.rzp2`）。
-
----
-
-## 9. 文档与社区（P2）
-
-- [ ] 多语言文档（英文版 README / FORMAT / API）。
-- [ ] 安全性与性能基准报告，随版本发布。
-- [ ] 贡献指南（CONTRIBUTING.md）与 issue 模板。
-
----
-
-## 里程碑建议（非时间承诺）
-
-- **0.4**（已发布）：流式接口 + SIMD 加密原语（ChaCha20 AVX2）+ `--force` / 进度条 +
-  私钥口令加密 + 分块 AEAD（v3 容器）。
-- **0.5**：LZMA 匹配器升级 + 分块并行 + 多接收者 + 归档过滤（P1 主体）。（已完成）
-- **0.6 / 1.0**：容器 v3 完整分块（TLV 头部 / 随机访问 / 可追加）+ 安全审计 + 常量时间
-  加固 + crates.io / 签名分发。
+- 任何新能力不得破坏「零运行时第三方依赖」与「核心算法手写可审计」定位。
+- 格式变更必须考虑向后兼容（读取端保留旧版本），并在 `FORMAT.md` / `CHANGELOG.md`
+  同步更新。
+- 性能优化以可复现的 `bench` 数据为准，跨机器对齐单线程/固定进程基线。

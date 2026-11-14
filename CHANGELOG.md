@@ -2,6 +2,24 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.13.0] - 2026-11-14
+
+### 新增
+
+- 并行解压：`decode_blocks_parallel` 复用多进程模型，对分块 LZMA 载荷并行解压；工作进程
+  崩溃 / 失败时由主进程串行补齐缺失块
+- 流式压缩 + 明文校验和：未加密且可 seek 的文件输出，边流式压缩边累加 SHAKE-256，写完后
+  `seek` 回写头部摘要；加密或不可 seek（stdout）回退缓冲式打包
+- `--processes` 默认按 `available_parallelism()` 自动检测 CPU 核数（`compress` /
+  `decompress` / `xz`）
+- 多接收者公钥指纹：`Recipient.fingerprint`（SHAKE-256，32 字节），解密时按指纹快速跳过
+  不匹配接收者，`info` 展示各接收者指纹
+
+### 变更
+
+- `.rzp2` v3 多接收者模式在 `flags2.FINGERPRINT` 置位时，为每个接收者额外写入 32 字节
+  公钥指纹；旧格式读取端将其视为缺失（全零），保持向后兼容
+
 ## [0.12.0] - 2026-11-14
 
 ### 新增

@@ -1,10 +1,12 @@
 //! RZP2 读写管线：压缩 →（可选）加密 → 封包；解包 →（可选）解密 → 解压。
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 
 use crate::aead;
 use crate::crypto::zeroize::Zeroize;
-use crate::format::{Header, KemParams, Recipient, CHECKSUM_SIZE, NONCE_SIZE, SALT_SIZE, TAG_SIZE};
+use crate::format::{
+    Header, KemParams, Recipient, CHECKSUM_SIZE, FINGERPRINT_SIZE, NONCE_SIZE, SALT_SIZE, TAG_SIZE,
+};
 use crate::hybrid::{self, HybridCiphertext};
 use crate::lzma::{self, LzmaParams};
 use crate::mlkem::fips202::{shake256, Keccak};
@@ -117,7 +119,15 @@ pub fn checksum(data: &[u8]) -> [u8; CHECKSUM_SIZE] {
     out
 }
 
+/// 计算接收者公钥指纹（SHAKE-256，32 字节）。
+pub fn fingerprint(pk: &[u8]) -> [u8; FINGERPRINT_SIZE] {
+    let mut out = [0u8; FINGERPRINT_SIZE];
+    shake256(&mut out, pk);
+    out
+}
+
 /// 打包时的加密配置。
+#[derive(Clone, Copy)]
 pub enum Encryption<'a> {
     /// 不加密。
     None,
@@ -206,18 +216,27 @@ fn seal_multi_recipients(
             kem,
             ek: kem_ct,
             wrapped_dek: wrapped,
+            fingerprint: fingerprint(pk),
         });
     }
     header.recipients = recs;
     Ok((dek, nonce))
 }
 
-/// 用接收者私钥尝试解包 DEK。多接收者场景下逐个尝试，首个认证成功即为该私钥对应项。
+/// 用接收者私钥尝试解包 DEK。多接收者场景下按公钥指纹快速定位对应接收者，
+/// 指纹缺失（旧格式）或无法识别私钥参数集时回退为逐个尝试，首个认证成功即返回。
 fn try_unwrap_dek(header: &Header, sk: &[u8]) -> Result<[u8; aead::KEY_SIZE], PipelineError> {
+    let own_fp = public_key_fingerprint(sk);
     for r in &header.recipients {
         let params = mlkem_params(r.kem);
         if r.ek.len() != params.ciphertext_bytes {
             continue;
+        }
+        // 指纹存在且与本私钥不匹配，直接跳过；全零指纹（旧格式）仍尝试。
+        if let Some(fp) = own_fp {
+            if r.fingerprint != [0u8; FINGERPRINT_SIZE] && r.fingerprint != fp {
+                continue;
+            }
         }
         let mut ss = hybrid::decapsulate_ss(&params, sk, &r.ek);
         if let Ok(dek) = hybrid::unwrap_dek(&params, &ss, &r.ek, &r.wrapped_dek) {
@@ -229,6 +248,28 @@ fn try_unwrap_dek(header: &Header, sk: &[u8]) -> Result<[u8; aead::KEY_SIZE], Pi
     Err(PipelineError::Hybrid(
         hybrid::HybridError::AuthenticationFailed,
     ))
+}
+
+/// 从私钥字节中提取公钥并计算指纹；无法识别参数集时返回 `None`。
+fn public_key_fingerprint(sk: &[u8]) -> Option<[u8; FINGERPRINT_SIZE]> {
+    let p = params_for_sk_len(sk.len())?;
+    // sk 布局：dk_PKE || pk || H(pk) || z，其中 dk_PKE 长 `k * POLY_BYTES`。
+    let indcpa_sk = p.k * crate::mlkem::params::POLY_BYTES;
+    if sk.len() < indcpa_sk + p.public_key_bytes {
+        return None;
+    }
+    let pk = &sk[indcpa_sk..indcpa_sk + p.public_key_bytes];
+    Some(fingerprint(pk))
+}
+
+/// 根据私钥长度识别 ML-KEM 参数集。
+fn params_for_sk_len(len: usize) -> Option<Params> {
+    for p in [mlkem::MLKEM512, mlkem::MLKEM768, mlkem::MLKEM1024] {
+        if len == p.secret_key_bytes {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// 打包（压缩，可选加密）为完整 `.rzp2` 字节流。
@@ -377,6 +418,44 @@ pub fn pack_to_writer<R: Read, W: Write>(
             writer,
         )?),
     }
+}
+
+/// 流式打包到可 seek 的 writer，并支持明文校验和。
+///
+/// 未加密场景下，头部校验和字段位于头部末尾且不参与加密 AAD，因此可在写完载荷后
+/// 回写；加密场景校验和位于头部且被 AAD 绑定，无法事后修改，返回
+/// [`PipelineError::StreamingChecksum`]（调用方应回退到缓冲式打包）。
+pub fn pack_to_writer_checksummed<R: Read, W: Write + Seek>(
+    reader: &mut R,
+    config: &PackConfig,
+    original_size: Option<u64>,
+    writer: &mut W,
+) -> Result<u64, PipelineError> {
+    if !config.add_checksum {
+        return pack_to_writer(reader, config, original_size, writer);
+    }
+    if !matches!(config.encryption, Encryption::None) {
+        return Err(PipelineError::StreamingChecksum);
+    }
+
+    let mut header = Header::plain(original_size.unwrap_or(u64::MAX), u64::MAX);
+    header.level = config.level;
+    header.archive = config.archive;
+    header.checksum = true;
+    let header_bytes = header.encode();
+    writer.write_all(&header_bytes)?;
+    let checksum_offset = (header_bytes.len() - CHECKSUM_SIZE) as u64;
+
+    let mut hashing = HashingReader::new(reader, true);
+    let n = lzma::encode_stream(&mut hashing, &config.params, original_size, writer)?;
+    let (_size, digest) = hashing.finish();
+
+    // 回写头部校验和字段，然后把文件指针恢复到载荷末尾。
+    let end = writer.stream_position()?;
+    writer.seek(std::io::SeekFrom::Start(checksum_offset))?;
+    writer.write_all(&digest)?;
+    writer.seek(std::io::SeekFrom::Start(end))?;
+    Ok(n)
 }
 
 /// 在读取过程中增量累计 SHAKE-256 校验和与字节数。
@@ -621,12 +700,21 @@ fn decrypt_payload<'a>(
 
 /// 解包完整 `.rzp2` 字节流（解压，可选解密）。
 pub fn unpack(data: &[u8], key: DecryptKey) -> Result<Vec<u8>, PipelineError> {
+    unpack_with_processes(data, key, 1)
+}
+
+/// 解包完整 `.rzp2` 字节流，分块载荷用 `processes` 个工作进程并行解压。
+pub fn unpack_with_processes(
+    data: &[u8],
+    key: DecryptKey,
+    processes: usize,
+) -> Result<Vec<u8>, PipelineError> {
     let (header, offset) = Header::decode(data)?;
     let compressed = decrypt_payload(data, &header, offset, key)?;
 
     // 3. 解压。
     let plaintext = if header.blocked {
-        lzma::decode_blocks(&compressed)?
+        lzma::decode_blocks_with_processes(&compressed, processes)?
     } else {
         lzma::decode(&compressed)?
     };
@@ -685,6 +773,16 @@ pub fn unpack_to_writer<W: Write>(
     key: DecryptKey,
     writer: &mut W,
 ) -> Result<u64, PipelineError> {
+    unpack_to_writer_with_processes(data, key, writer, 1)
+}
+
+/// 流式解包：解压后的明文直接写入 `writer`，分块载荷用 `processes` 个工作进程并行解压。
+pub fn unpack_to_writer_with_processes<W: Write>(
+    data: &[u8],
+    key: DecryptKey,
+    writer: &mut W,
+    processes: usize,
+) -> Result<u64, PipelineError> {
     let (header, offset) = Header::decode(data)?;
     let compressed = decrypt_payload(data, &header, offset, key)?;
 
@@ -694,7 +792,7 @@ pub fn unpack_to_writer<W: Write>(
         checksum_enabled: header.checksum,
     };
     let written = if header.blocked {
-        let plaintext = lzma::decode_blocks(&compressed)?;
+        let plaintext = lzma::decode_blocks_with_processes(&compressed, processes)?;
         sink.write_all(&plaintext)?;
         plaintext.len()
     } else {
@@ -1070,5 +1168,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PipelineError::StreamingChecksum));
+    }
+
+    #[test]
+    fn pack_to_writer_checksummed_roundtrip() {
+        let data = b"streaming checksummed roundtrip".repeat(5000);
+        let mut cfg = config(Encryption::None);
+        cfg.add_checksum = true;
+        let mut r = std::io::Cursor::new(&data);
+        let mut out = std::io::Cursor::new(Vec::new());
+        let n = pack_to_writer_checksummed(&mut r, &cfg, Some(data.len() as u64), &mut out).unwrap();
+        assert_eq!(n as usize, data.len());
+        let packed = out.into_inner();
+        let (header, _) = Header::decode(&packed).unwrap();
+        assert!(header.checksum);
+        assert_eq!(unpack(&packed, DecryptKey::None).unwrap(), data);
     }
 }

@@ -13,7 +13,7 @@ pub mod completion;
 pub mod sfx;
 
 use std::fs::File;
-use std::io::{BufRead, IsTerminal, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -31,8 +31,9 @@ use crate::keys::{
 use crate::lzma::{self, LzmaParams};
 use crate::mlkem;
 use crate::pipeline::{
-    checksum, mlkem_params, pack, pack_stream_with_size, pack_to_writer, unpack,
-    unpack_to_writer, DecryptKey, Encryption, PackConfig, PipelineError,
+    checksum, mlkem_params, pack, pack_stream_with_size, pack_to_writer,
+    pack_to_writer_checksummed, unpack, unpack_to_writer_with_processes, unpack_with_processes,
+    DecryptKey, Encryption, PackConfig, PipelineError,
 };
 use crate::progress::{Progress, ProgressReader, ProgressWriter};
 use crate::split;
@@ -142,6 +143,7 @@ struct DecompressOpts {
     force: bool,
     dry_run: bool,
     entry: Option<String>,
+    processes: usize,
 }
 
 struct KeygenOpts {
@@ -443,7 +445,7 @@ fn parse_compress(args: &[String]) -> Result<CompressOpts, String> {
     let mut force = false;
     let mut include: Vec<String> = Vec::new();
     let mut exclude: Vec<String> = Vec::new();
-    let mut processes: usize = 1;
+    let mut processes: usize = default_processes();
     let mut block_size: usize = lzma::DEFAULT_BLOCK_SIZE;
     let mut dry_run = false;
 
@@ -528,6 +530,7 @@ fn parse_decompress(args: &[String]) -> Result<DecompressOpts, String> {
     let mut force = false;
     let mut dry_run = false;
     let mut entry: Option<String> = None;
+    let mut processes: usize = default_processes();
 
     while let Some(token) = it.next() {
         let (flag, inline) = split_option(token);
@@ -543,6 +546,7 @@ fn parse_decompress(args: &[String]) -> Result<DecompressOpts, String> {
                 ask_pass = true;
             }
             "--entry" => entry = Some(it.value(flag, inline)?),
+            "--processes" => processes = parse_usize_option(flag, &it.value(flag, inline)?)?,
             "-f" | "--force" | "--overwrite" => {
                 reject_value(flag, inline)?;
                 force = true;
@@ -576,6 +580,7 @@ fn parse_decompress(args: &[String]) -> Result<DecompressOpts, String> {
         force,
         dry_run,
         entry,
+        processes,
     })
 }
 
@@ -1037,6 +1042,18 @@ fn parse_bench(args: &[String]) -> Result<BenchOpts, String> {
 // 命令实现
 // ---------------------------------------------------------------------------
 
+/// 可用并行度（逻辑核心数），检测失败回退 1。
+fn default_processes() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// 字节数组转小写十六进制字符串（用于展示指纹等）。
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn read_input(path: &str) -> Result<Vec<u8>, String> {
     if path == "-" {
         use std::io::Read;
@@ -1108,6 +1125,12 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
+impl<W: Write + Seek> Seek for CountingWriter<W> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
 /// 写单文件输出前检查目标是否已存在（`-` 表示 stdout，跳过检查）。
 fn ensure_not_exists(path: &str, force: bool) -> Result<(), String> {
     if path != "-" && !force && std::path::Path::new(path).exists() {
@@ -1142,6 +1165,7 @@ fn stream_decompress(
     key: DecryptKey<'_>,
     total: u64,
     label: &'static str,
+    processes: usize,
 ) -> Result<u64, String> {
     let inner: Box<dyn Write> = if output == "-" {
         Box::new(std::io::stdout().lock())
@@ -1150,7 +1174,7 @@ fn stream_decompress(
     };
 
     let mut writer = ProgressWriter::new(inner, label, total, style::stderr_tty());
-    let result = unpack_to_writer(buf, key, &mut writer);
+    let result = unpack_to_writer_with_processes(buf, key, &mut writer, processes);
     writer.finish();
 
     match result {
@@ -1513,27 +1537,67 @@ fn cmd_compress(o: &CompressOpts) -> i32 {
         }
         (len, out_len)
     } else if o.checksum {
-        // 需要明文校验和：缓冲式流式打包（结果仍整体返回）。
-        let mut reader = match open_input_stream(&o.input) {
-            Ok(r) => r,
-            Err(e) => {
+        // 明文校验和：文件输出 + 未加密时可经 seek 回写头部实现流式校验和；
+        // 其余情况（stdout / 加密）回退到缓冲式流式打包。
+        let can_seek = o.output != "-" && matches!(config.encryption, Encryption::None);
+        if can_seek {
+            let reader = match open_input_stream(&o.input) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{}: {e}", err_prefix());
+                    return 1;
+                }
+            };
+            let original_hint = if o.input == "-" {
+                None
+            } else {
+                std::fs::metadata(&o.input).ok().map(|m| m.len())
+            };
+            let writer = match File::create(&o.output) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("{}: 创建 `{}` 失败: {e}", err_prefix(), o.output);
+                    return 1;
+                }
+            };
+            let total = original_hint.unwrap_or(0);
+            let mut preader = ProgressReader::new(reader, "压缩", total, style::stderr_tty());
+            let mut cw = CountingWriter::new(writer);
+            let written =
+                match pack_to_writer_checksummed(&mut preader, &config, original_hint, &mut cw) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        preader.finish();
+                        eprintln!("{}: 压缩失败: {e}", err_prefix());
+                        let _ = std::fs::remove_file(&o.output);
+                        return 1;
+                    }
+                };
+            preader.finish();
+            let _ = cw.flush();
+            (written, cw.count)
+        } else {
+            let mut reader = match open_input_stream(&o.input) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{}: {e}", err_prefix());
+                    return 1;
+                }
+            };
+            let (packed, len) = match pack_stream_with_size(&mut reader, &config) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}: 压缩失败: {e}", err_prefix());
+                    return 1;
+                }
+            };
+            let out_len = packed.len() as u64;
+            if let Err(e) = write_output(&o.output, &packed) {
                 eprintln!("{}: {e}", err_prefix());
                 return 1;
             }
-        };
-        let (packed, len) = match pack_stream_with_size(&mut reader, &config) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("{}: 压缩失败: {e}", err_prefix());
-                return 1;
-            }
-        };
-        let out_len = packed.len() as u64;
-        if let Err(e) = write_output(&o.output, &packed) {
-            eprintln!("{}: {e}", err_prefix());
-            return 1;
+            (len, out_len)
         }
-        (len, out_len)
     } else {
         // 流式压缩并直接写盘（加密走分块 AEAD，不再整体驻留压缩载荷）。
         let reader = match open_input_stream(&o.input) {
@@ -1646,7 +1710,7 @@ fn cmd_decompress(o: &DecompressOpts) -> i32 {
     if header.archive {
         if let Some(entry_path) = &o.entry {
             // 单条目抽取：仍需整包解压以精确匹配路径。
-            let plaintext = match unpack(&buf, credential_to_key(&cred)) {
+            let plaintext = match unpack_with_processes(&buf, credential_to_key(&cred), o.processes) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!(
@@ -1711,7 +1775,7 @@ fn cmd_decompress(o: &DecompressOpts) -> i32 {
             return 1;
         }
         let mut extractor = ArchiveExtractor::new(out_dir);
-        if let Err(e) = unpack_to_writer(&buf, credential_to_key(&cred), &mut extractor) {
+        if let Err(e) = unpack_to_writer_with_processes(&buf, credential_to_key(&cred), &mut extractor, o.processes) {
             eprintln!(
                 "{}: {}",
                 err_prefix(),
@@ -1749,7 +1813,7 @@ fn cmd_decompress(o: &DecompressOpts) -> i32 {
         } else {
             "解压"
         };
-        match stream_decompress(&o.output, &buf, credential_to_key(&cred), total, label) {
+        match stream_decompress(&o.output, &buf, credential_to_key(&cred), total, label, o.processes) {
             Ok(written) => {
                 println_status(
                     &o.output,
@@ -1772,8 +1836,9 @@ fn cmd_decompress(o: &DecompressOpts) -> i32 {
 }
 
 fn cmd_xz(o: &XzOpts) -> i32 {
+    let processes = o.processes.unwrap_or_else(default_processes);
     if o.dry_run {
-        let multi = if o.block_size.is_some() || o.processes.is_some() {
+        let multi = if o.block_size.is_some() || processes > 1 {
             "（多块）"
         } else {
             ""
@@ -1793,13 +1858,11 @@ fn cmd_xz(o: &XzOpts) -> i32 {
         }
     };
     let params = build_lzma_params(o.level, o.dict_size);
-    let packed = match (o.block_size, o.processes) {
-        (Some(_), _) | (_, Some(_)) => {
-            let block_size = o.block_size.unwrap_or(lzma::DEFAULT_BLOCK_SIZE);
-            let processes = o.processes.unwrap_or(1);
-            xz::encode_blocks(&data, &params, block_size, processes)
-        }
-        _ => xz::encode(&data, &params),
+    let packed = if o.block_size.is_some() || processes > 1 {
+        let block_size = o.block_size.unwrap_or(lzma::DEFAULT_BLOCK_SIZE);
+        xz::encode_blocks(&data, &params, block_size, processes)
+    } else {
+        xz::encode(&data, &params)
     };
     let packed = match packed {
         Ok(p) => p,
@@ -2052,6 +2115,16 @@ fn cmd_info(o: &InfoOpts) -> i32 {
             header.iterations,
             header.lanes
         );
+    }
+    if header.multi {
+        for (i, r) in header.recipients.iter().enumerate() {
+            println!(
+                "{}: {} ({})",
+                cyan(&format!("接收者 {}", i + 1)),
+                r.kem,
+                hex_bytes(&r.fingerprint)
+            );
+        }
     }
     println!(
         "{}: {}",
@@ -3713,7 +3786,7 @@ compress 选项:
       --checksum            附加未压缩明文 SHAKE-256 校验和
       --include <glob>      仅打包匹配的路径（可重复，仅目录归档）
       --exclude <glob>      排除匹配的路径（可重复，仅目录归档）
-      --processes <n>         并行压缩进程数（>1 启用分块压缩，默认 1）
+      --processes <n>         并行压缩进程数（>1 启用分块压缩，默认按可用并行度）
       --block-size <bytes>  分块压缩每块大小（默认 4 MiB）
       --dry-run             只打印将执行的动作，不实际读写
   -f, --force               覆盖已存在的输出文件
@@ -3725,6 +3798,7 @@ decompress 选项:
       --password <pw>       口令（口令加密容器必需；缺省且终端可用时自动提示）
       --ask-pass            强制交互式输入口令
       --entry <path>        仅从归档抽取单个条目（-o - 输出到 stdout）
+      --processes <n>         并行解压进程数（分块载荷生效，默认按可用并行度）
       --dry-run             只打印将执行的动作，不实际读写
   -f, --force               覆盖已存在的输出文件
 
@@ -3742,7 +3816,7 @@ keygen 选项:
       --params <set>        ML-KEM 参数集（默认 mlkem768）
       --public <file>       公钥输出路径（默认 rzp2_<params>.key.pub）
       --private <file>      私钥输出路径（默认 rzp2_<params>.key）
-      --private-password <pw> 口令加密私钥（- 表示交互式无回显读取）
+      --private-password <pw>  口令加密私钥（- 表示交互式无回显读取）
 
 sfx 选项:
   -o, --output <file>       输出自解压可执行文件（默认 <input> 去 .rzp2，Windows 加 .exe）
@@ -3775,7 +3849,7 @@ xz 选项:
       --level <0-9>         压缩级别（默认 5）
       --dict-size <bytes>   覆盖 LZMA2 字典大小
       --block-size <bytes>  产出多块 .xz（每个 Block 的未压缩大小）
-      --processes <n>         多块并行压缩进程数（隐含多块）
+      --processes <n>         多块并行压缩进程数（隐含多块，默认按可用并行度）
       --dry-run             只打印将执行的动作，不实际读写
   -f, --force               覆盖已存在的输出文件
 

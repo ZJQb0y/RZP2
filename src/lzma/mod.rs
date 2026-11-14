@@ -188,7 +188,18 @@ pub fn encode_blocks(
 
 /// 解压 [`encode_blocks`] 产生的帧序列，拼接各块明文。
 pub fn decode_blocks(input: &[u8]) -> Result<Vec<u8>, LzmaError> {
-    let mut out = Vec::new();
+    decode_blocks_with_processes(input, 1)
+}
+
+/// 用 `processes` 个工作进程并行解压 [`encode_blocks`] 产生的帧序列。
+///
+/// `processes == 1` 时退化为串行解压；帧先解析为独立块切片，再交给多进程并行解码。
+pub fn decode_blocks_with_processes(
+    input: &[u8],
+    processes: usize,
+) -> Result<Vec<u8>, LzmaError> {
+    // 1. 解析帧序列得到各块切片（每个块为完整 alone 流）。
+    let mut blocks: Vec<&[u8]> = Vec::new();
     let mut offset = 0usize;
     loop {
         if offset + 4 > input.len() {
@@ -202,9 +213,16 @@ pub fn decode_blocks(input: &[u8]) -> Result<Vec<u8>, LzmaError> {
         if offset + len > input.len() {
             return Err(LzmaError::Truncated);
         }
-        let decoded = decode(&input[offset..offset + len])?;
+        blocks.push(&input[offset..offset + len]);
         offset += len;
-        out.extend_from_slice(&decoded);
+    }
+
+    // 2. 并行解码并按序拼接。
+    let decoded = crate::parallel::decode_blocks_parallel(&blocks, processes)?;
+    let total = decoded.iter().map(|b| b.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for block in decoded {
+        out.extend_from_slice(&block);
     }
     Ok(out)
 }
