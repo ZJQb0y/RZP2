@@ -1,0 +1,23 @@
+{
+  "version": "0.8.0",
+  "description": "From-scratch hybrid encryption compression tool (LZMA + ML-KEM + ChaCha20-Poly1305)",
+  "homepage": "https://github.com/ZJQb0y/rzp2",
+  "license": "MIT OR Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/ZJQb0y/rzp2/releases/download/v0.8.0/rzp2-0.8.0-x86_64-windows.zip",
+      "hash": "REPLACE_WITH_SHA256"
+    }
+  },
+  "bin": "rzp2.exe",
+  "checkver": {
+    "github": "https://github.com/ZJQb0y/rzp2"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/ZJQb0y/rzp2/releases/download/v$version/rzp2-$version-x86_64-windows.zip"
+      }
+    }
+  }
+}

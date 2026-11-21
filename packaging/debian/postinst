@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# 安装/升级后刷新 MIME 数据库，使 .rzp2 -> application/x-rzp2 映射立即生效。
+if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database /usr/share/mime
+fi
+
+# 生成 shell Tab 补全脚本（bash / zsh / fish）。
+if command -v rzp2 >/dev/null 2>&1; then
+    mkdir -p /usr/share/bash-completion/completions \
+             /usr/share/zsh/site-functions \
+             /usr/share/fish/vendor_completions.d 2>/dev/null || true
+    rzp2 completion bash > /usr/share/bash-completion/completions/rzp2 2>/dev/null || true
+    rzp2 completion zsh  > /usr/share/zsh/site-functions/_rzp2 2>/dev/null || true
+    rzp2 completion fish > /usr/share/fish/vendor_completions.d/rzp2.fish 2>/dev/null || true
+fi
+
+exit 0

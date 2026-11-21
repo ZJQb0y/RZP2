@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+# 卸载后刷新 MIME 数据库，清除已移除的 .rzp2 映射。
+if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database /usr/share/mime
+fi
+
+# 清理 shell Tab 补全脚本。
+rm -f /usr/share/bash-completion/completions/rzp2 \
+      /usr/share/zsh/site-functions/_rzp2 \
+      /usr/share/fish/vendor_completions.d/rzp2.fish 2>/dev/null || true
+
+exit 0

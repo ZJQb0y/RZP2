@@ -1,0 +1,120 @@
+[package]
+name = "rzp2"
+version = "0.19.1"
+edition = "2021"
+description = "RZP2: LZMA + ML-KEM hybrid encrypted compression tool"
+license = "MIT OR Apache-2.0"
+authors = ["张俊琦 <13391713309@189.cn>"]
+repository = "https://github.com/ZJQb0y/rzp2"
+
+[lib]
+name = "rzp2"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rzp2"
+path = "src/main.rs"
+
+# 零运行时第三方依赖：OS 随机源与密钥清零均从零实现（见 src/crypto/rand.rs、zeroize.rs）。
+
+# 仅测试期使用；不改变「零运行时依赖」的定位。
+[dev-dependencies]
+serde_json = "1"
+
+# 手写密码学 / 算法内核（ML-KEM、LZMA、ChaCha20、Poly1305）刻意保持与规范/参考实现
+# 逐行对应的可审计性，这些「风格类」lint 在此类代码中不适用，故集中豁免。
+[lints.clippy]
+needless_range_loop = "allow"
+identity_op = "allow"
+assign_op_pattern = "allow"
+explicit_counter_loop = "allow"
+manual_memcpy = "allow"
+chunks_exact_to_as_chunks = "allow"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = true
+
+# 工作区：核心库/CLI 之外，额外产出按功能拆分的 C ABI 动态库
+# （librzp2_compress / librzp2_crypto），供其它语言在无需 CLI 的情况下调用。
+[workspace]
+members = ["crates/rzp2-compress", "crates/rzp2-crypto"]
+resolver = "2"
+
+[package.metadata.deb]
+maintainer = "张俊琦 <13391713309@189.cn>"
+copyright = "2026 张俊琦 <13391713309@189.cn>"
+license-file = "LICENSE"
+section = "utils"
+priority = "optional"
+# shared-mime-info 提供 update-mime-database 与 /usr/share/mime/packages 的 dpkg 触发器，
+# 安装/卸载时自动重建 MIME 数据库，使 .rzp2 文件能显示对应图标。
+depends = ["$auto", "shared-mime-info"]
+# 右键菜单扩展的运行依赖；用 recommends 而非 depends，避免在无图形桌面的
+# 服务器上强制拉入整个 Nautilus。
+recommends = ["python3-nautilus", "python3-gi"]
+assets = [
+    "$auto",
+    ["packaging/mime/rzp2.xml", "usr/share/mime/packages/rzp2.xml", "644"],
+    ["assets/rzp2.svg", "usr/share/icons/hicolor/scalable/mimetypes/application-x-rzp2.svg", "644"],
+    ["assets/rzp2.png", "usr/share/icons/hicolor/512x512/mimetypes/application-x-rzp2.png", "644"],
+    ["packaging/nautilus/rzp2-menu.py", "usr/share/nautilus-python/extensions/rzp2-menu.py", "644"],
+    ["LICENSE-MIT", "usr/share/doc/rzp2/LICENSE-MIT", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/rzp2/LICENSE-APACHE", "644"],
+]
+maintainer-scripts = "packaging/debian"
+
+[package.metadata.generate-rpm]
+# 与 [package.metadata.deb] 保持一致：MIME 类型、图标、Nautilus 扩展与文档一并安装。
+# RPM 侧没有 $auto，需显式列出所有产物；cargo generate-rpm 直接生成 .rpm，无需 rpmbuild。
+release = "1"
+post_install_script = """
+if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database /usr/share/mime
+fi
+
+# 生成 shell Tab 补全脚本（bash / zsh / fish）。
+if command -v rzp2 >/dev/null 2>&1; then
+    mkdir -p /usr/share/bash-completion/completions /usr/share/zsh/site-functions /usr/share/fish/vendor_completions.d 2>/dev/null || true
+    rzp2 completion bash > /usr/share/bash-completion/completions/rzp2 2>/dev/null || true
+    rzp2 completion zsh  > /usr/share/zsh/site-functions/_rzp2 2>/dev/null || true
+    rzp2 completion fish > /usr/share/fish/vendor_completions.d/rzp2.fish 2>/dev/null || true
+fi
+"""
+post_uninstall_script = """
+if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database /usr/share/mime
+fi
+
+# 清理 shell Tab 补全脚本。
+rm -f /usr/share/bash-completion/completions/rzp2 /usr/share/zsh/site-functions/_rzp2 /usr/share/fish/vendor_completions.d/rzp2.fish 2>/dev/null || true
+"""
+assets = [
+    { source = "target/release/rzp2", dest = "/usr/bin/rzp2", mode = "755" },
+    { source = "man/rzp2.1", dest = "/usr/share/man/man1/rzp2.1", mode = "644" },
+    { source = "packaging/mime/rzp2.xml", dest = "/usr/share/mime/packages/rzp2.xml", mode = "644" },
+    { source = "assets/rzp2.svg", dest = "/usr/share/icons/hicolor/scalable/mimetypes/application-x-rzp2.svg", mode = "644" },
+    { source = "assets/rzp2.png", dest = "/usr/share/icons/hicolor/512x512/mimetypes/application-x-rzp2.png", mode = "644" },
+    { source = "packaging/nautilus/rzp2-menu.py", dest = "/usr/share/nautilus-python/extensions/rzp2-menu.py", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/rzp2/README.md", mode = "644", doc = true },
+    { source = "FORMAT.md", dest = "/usr/share/doc/rzp2/FORMAT.md", mode = "644", doc = true },
+    { source = "API.md", dest = "/usr/share/doc/rzp2/API.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/rzp2/LICENSE", mode = "644", doc = true },
+    { source = "LICENSE-MIT", dest = "/usr/share/doc/rzp2/LICENSE-MIT", mode = "644", doc = true },
+    { source = "LICENSE-APACHE", dest = "/usr/share/doc/rzp2/LICENSE-APACHE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+# update-mime-database 由 post_install_script 调用，用于重建 MIME 数据库。
+shared-mime-info = "*"
+
+[package.metadata.generate-rpm.recommends]
+# 右键菜单扩展的运行依赖；RPM 弱依赖，缺失不影响安装。
+nautilus-python = "*"
+python3-gobject = "*"

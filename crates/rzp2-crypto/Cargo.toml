@@ -1,0 +1,14 @@
+[package]
+name = "rzp2-crypto"
+version = "0.19.1"
+edition = "2021"
+description = "RZP2 加密/解密动态库（ML-KEM + ChaCha20-Poly1305，C ABI）"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "rzp2_crypto"
+crate-type = ["cdylib"]
+
+[dependencies]
+rzp2 = { path = "../.." }

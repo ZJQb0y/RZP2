@@ -1,0 +1,370 @@
+# 变更日志
+
+本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
+
+## [0.19.1] - 2026-11-21
+
+### 新增
+
+- CLI 欢迎横幅：命令开头输出 ASCII 艺术字横幅，含版本号、项目简介与问题反馈渠道
+  （邮箱与 GitHub Issue 链接）；依据 `LC_ALL` / `LC_MESSAGES` / `LANG` 自动在中文与
+  英文之间切换，且仅在交互式终端（stderr 为 TTY）输出，不污染脚本与管道
+
+### 修复
+
+- Windows（`x86_64-pc-windows-gnu`）交叉编译链接错误：`GetProcessMemoryInfo` 属于
+  `psapi` 库，已从 `kernel32` 链接块拆出并单独 `#[link(name = "psapi")]`，修复
+  `undefined reference to 'GetProcessMemoryInfo'`
+
+## [0.19.0] - 2026-11-20
+
+### 新增
+
+- `bench` 更丰富的统计：除中位数外，每项基准额外报告 min/max 范围与变异系数（波动），
+  并改用分批计时 + `black_box` 防优化，提升计时精度与稳定性
+- `bench` 峰值内存测量：每项基准报告峰值常驻内存（RSS）增量；Linux 用 fork + `/proc`，
+  macOS 用 fork + mach `task_info`，Windows 用 `GetProcessMemoryInfo`（进程级高水位，
+  后续较轻基准可能显示为 0）
+- `bench --sweep`：一次性扫描 LZMA 级别 0~9 的压缩吞吐与压缩率，便于选取最佳档位
+- 格式感知重压缩（PNG）：把 PNG 的 IDAT 内 zlib/DEFLATE 流反解到符号层后序列化，
+  重建时按原始 IDAT 切分并重算 CRC32，逐位还原；作为 `Filter::Png` 接入过滤链
+  （非保长），`--filter png` 可用
+- 格式感知重压缩（GIF）：把 GIF87a / GIF89a 图像数据的 LZW 码流反解到符号层后
+  序列化，重建时按原始子块切分逐位还原；作为 `Filter::Gif` 接入过滤链（非保长），
+  `--filter gif`（别名 `gif87a` / `gif89a`）可用
+- 格式感知重压缩（ZIP）：把 ZIP 归档内压缩方法 8（DEFLATE）条目数据的原始 DEFLATE
+  流反解到符号层后序列化，本地文件头 / 中央目录 / 数据描述符 / 存储条目（方法 0）与
+  其他元数据原样保留，逐位还原；`Filter::Deflate` 新增 ZIP 分支，`--filter deflate`
+  （别名 `zip`）可同时识别 gzip 与 ZIP 容器
+
+### 修复
+
+- 并行压缩（`--processes > 1`）此前不显示进度条，现已在分块并行分支接入读取与压缩
+  块进度，普通压缩也能看到进度
+- GIF LZW 重压缩按 giflib 语义修正码长递增：`clear` 码后紧随的第一个码不新增字典项、
+  不推进码长，并补齐码流尾部全零填充字节，修复真实动画 GIF 往返失败
+- 格式感知过滤器（`deflate` / `jpeg` / `png` / `gif`）在重压缩表示不比原始输入更小时
+  回退到原始字节，避免对已良好压缩的图片 / 媒体文件造成容器膨胀（此前 JPEG / PNG /
+  GIF 会显著变大）
+
+## [0.18.0] - 2026-11-20
+
+### 新增
+
+- 更强匹配查找：实现 BT4 二叉树匹配查找器（`lzma::match_finder`），`LzmaParams`
+  新增 `match_finder` 字段，高压缩级别（`level >= 8`）自动启用以获得更高压缩率
+- 可逆预过滤链：新增 `filters` 模块（Delta 差分 + BCJ x86 / ARM / ARM64 / RISC-V），
+  压缩前对可执行 / 固件 / 原始音频 / 图像等数据做保长可逆变换，解压后逆序还原；
+  CLI 新增 `--filter`（`x86/arm/arm64/riscv/delta[=N]`）按声明顺序链式应用
+- 容器格式升级到 v4：新增 `flags2.FILTERS` 标志位与过滤链头部字段，读取端保留对
+  v1 / v2 / v3 的兼容
+- 格式感知重压缩（DEFLATE）：新增 `recompress` 模块，把 gzip 内的 DEFLATE 流反解到
+  符号层（字面量 / 长度-距离匹配 / 块结构 / 原始动态 Huffman 表）后序列化，供外层
+  LZMA 进一步压缩，重建时逐位还原原始 gzip；作为 `Filter::Deflate` 接入过滤链（非保
+  长），复用 v4 `FILTERS` 标志与过滤链头部，`--filter deflate` 可用
+- 格式感知重压缩（JPEG，Lepton 式）：把 baseline 顺序 JPEG 的 Huffman 熵编码 DCT 系数
+  反解到符号层（DC 差分 / AC 游程-幅值）后序列化，重建时逐位还原原始熵段；作为
+  `Filter::Jpeg` 接入过滤链（非保长），`--filter jpeg` 可用；progressive / 算术编码 /
+  多扫描 / 重启动间隔回退原字节
+
+## [0.17.0] - 2026-11-20
+
+### 新增
+
+- 按功能拆分的 C ABI 动态库，无需 CLI 即可供 C/C++ 等语言按需链接：
+  - `rzp2-compress`（`rzp2_compress`）：LZMA1 alone 压缩 / 解压
+  - `rzp2-crypto`（`rzp2_crypto`）：ML-KEM(+X25519) 密钥生成与混合加解密、
+    ChaCha20-Poly1305 AEAD、Argon2id 口令派生
+- 两个动态库均附带 C 头文件（`crates/*/include/*.h`）与可编译运行的使用示例
+  （`examples/ffi/rzp2_compress_demo.c`、`examples/ffi/rzp2_crypto_demo.c`）
+- `package.sh` / `package.ps1` 打包时收集 `.so` / `.dll` 与头文件到 `dist` 的
+  `lib/`、`include/` 子目录
+
+## [0.16.1] - 2026-11-19
+
+### 修复
+
+- `.xz` 解压：兼容 liblzma（`tar -cJf` / 系统 `xz`）不在块头写压缩/未压缩大小的单块
+  输出，改为先解析流末尾的 Footer 与 Index 记录再反推块大小，修复误报 `corrupt .xz data`
+- `decompress` 解压仅含一个普通文件的外部归档（如 `.tar.xz`）时，直接把内容写到 `-o`
+  指定的文件，而不是套一层同名目录
+
+## [0.16.0] - 2026-11-18
+
+### 新增
+
+- 可压缩性探测：打包前采样，不可压缩数据直接以明文存储（`stored`，`flags2` bit4），
+  避免压缩率约 100% 时白耗 CPU，且省去 LZMA 头与结束标记、输出更小
+- 跨平台 SFX：`sfx` 子命令新增 `--stub <file>`，可在 Linux 上指定交叉编译出的
+  `rzp2.exe` 存根生成 Windows 自解压文件；`package.sh` 额外产出
+  `rzp2-<版本>-x86_64-windows-sfx-stub.exe`
+- 主流压缩格式解压打磨：
+  - `decompress --format <fmt>` 显式覆盖魔数探测（`gzip/xz/bzip2/tar/zip/7z`）
+  - `list` / `info` 扩展到外部归档与单文件，展示条目清单与格式元信息
+  - 外部归档解包复用 `--processes` 并行写文件条目
+
+### 变更
+
+- 抽取统一的 `decode_external` 解码入口，`decompress` / `list` / `info` 共用同一套
+  格式探测与解码逻辑，消除原先分散在 `decompress_external` 中的重复探测
+
+## [0.15.0] - 2026-11-17
+
+### 新增
+
+- 主流压缩格式解压：`decompress` 子命令按魔数自动探测 `.zip`、`.gz`、`.7z`、`.bz2`、
+  `.tar.gz`、`.tar.xz`，零第三方依赖手写各格式解析与解码内核，摆脱对系统
+  `unzip` / `7z` / `tar` 等外部工具的依赖
+- `deflate`：DEFLATE（RFC 1951）inflate，gzip / zip 的压缩内核（固定 / 动态 Huffman，
+  重叠 LZ77 回拷贝与存储块）
+- `gzip`：gzip（RFC 1952）容器解析（多 member、可选头、CRC32 + ISIZE 校验）
+- `tar`：tar 归档拆包（512 字节块头、GNU / PAX 长名称子集、校验和），与归档解包流程打通
+- `zip`：zip 容器解析（EOCD / 中央目录 / 本地头，方法 0 存储与 8 Deflate，CRC32）
+- `bzip2`：bzip2 解码（BWT 逆变换 + MTF + 二进制游程 + 多张 Huffman 表 + 块 CRC）
+- `sevenz`：7z 容器解析（签名头 / 明文与编码头 / PackInfo / UnPackInfo / SubStreamsInfo /
+  FilesInfo），复用 LZMA2 / LZMA1 内核，另支持 Copy 存储方法
+- `crc`：CRC32 / CRC64 校验原语，供 gzip / zip / xz / 7z 共用
+
+### 变更
+
+- 外部压缩 / 归档格式解码器（`crc` / `deflate` / `gzip` / `xz` / `tar` / `zip` /
+  `bzip2` / `sevenz`）统一归入 `src/formats/` 目录，经 `rzp2::formats` 模块组织；
+  根模块以扁平路径重新导出（`rzp2::gzip` / `rzp2::zip` 等），保持既有公共 API 不变
+
+## [0.14.0] - 2026-11-15
+
+### 新增
+
+- ML-KEM + X25519 混合封装：新增 `crypto::x25519`（RFC 7748）与 `hybrid` 的
+  `encapsulate_hybrid` / `decapsulate_hybrid` 等接口，密钥为 `mlkem_key || x25519_key`，
+  封装密文为 `mlkem_ct || x25519_epk`，两个共享密钥经 SHAKE-256 合并后再走 KDF 派生 AEAD 密钥
+- `KemParams` 扩展为 6 个变体（纯 ML-KEM 512/768/1024 及对应 `-x25519` 混合），
+  密钥文件 `params_byte` bit7 记录混合标志
+- CLI：`keygen` / `compress` / `decompress` 的 `--params` 支持 `mlkem768-x25519` 等
+  混合参数集；`info` 显示 `ML-KEM + X25519`
+
+### 变更
+
+- `.rzp2` v3 新增 `flags2.HYBRID`（`0b0000_1000`）标志，单接收者混合封装时 `ek` 为
+  `mlkem_ct || x25519_epk`；旧格式读取端将其视为普通 ML-KEM（无 `HYBRID`），保持向后兼容
+
+## [0.13.0] - 2026-11-14
+
+### 新增
+
+- 并行解压：`decode_blocks_parallel` 复用多进程模型，对分块 LZMA 载荷并行解压；工作进程
+  崩溃 / 失败时由主进程串行补齐缺失块
+- 流式压缩 + 明文校验和：未加密且可 seek 的文件输出，边流式压缩边累加 SHAKE-256，写完后
+  `seek` 回写头部摘要；加密或不可 seek（stdout）回退缓冲式打包
+- `--processes` 默认按 `available_parallelism()` 自动检测 CPU 核数（`compress` /
+  `decompress` / `xz`）
+- 多接收者公钥指纹：`Recipient.fingerprint`（SHAKE-256，32 字节），解密时按指纹快速跳过
+  不匹配接收者，`info` 展示各接收者指纹
+
+### 变更
+
+- `.rzp2` v3 多接收者模式在 `flags2.FINGERPRINT` 置位时，为每个接收者额外写入 32 字节
+  公钥指纹；旧格式读取端将其视为缺失（全零），保持向后兼容
+
+## [0.12.0] - 2026-11-14
+
+### 新增
+
+- 多进程并行块编码：新增 `parallel` 模块，把独立块交给多个工作进程并行压缩（Unix `fork` + 管道、
+  Windows `spawn` 复用本可执行文件的隐藏子命令）；任一工作进程崩溃不会拖垮主进程，缺失块串行补齐
+- 基准：`bench` 新增 `--processes`，可固定并行 LZMA2 压缩进程数，跨机器对比保持一致
+- 基准：`bench` 外部对比扩展到图片 / 视频 / 音频 / 纯文本，缺省使用内置确定性合成数据
+- 基准：`bench` 新增 `--image` / `--video` / `--audio` / `--text`，可传入真实文件进行对比
+- 基准：外部工具对比统一固定单线程（xz/zstd `-T1`、7z `-mmt=1`），并打印 CPU / OS / 核心数与工具版本，便于跨机器复现
+- 基准：补齐 ML-KEM-512/1024、Argon2id 口令派生、ChaCha20-Poly1305 AEAD、SHAKE-256 校验和、BLAKE2b，以及 `.rzp2` 分块并行管线基准
+- 基准：压缩项同时报告压缩率，并增加预热与多轮中位数测量，降低抖动
+- 基准：`bench` 新增 `--level`，可指定 LZMA 压缩级别并同步对齐外部工具（xz `-N`、7z `-mx=N` 与对应字典）
+- 基准：`bench` 新增 `--budget`，可调整每项基准的时间预算（默认 500 ms）
+- 基准：`bench` 新增 `--json`，以结构化 JSON 输出全部结果与运行环境（OS/CPU/核心数/工具版本）
+
+### 变更
+
+- 并行压缩从「单进程多线程」改为「多进程」：`lzma::encode_blocks` / `lzma2::encode_parallel` /
+  `xz::encode_blocks` 改走多进程，任一工作进程崩溃不会拖垮主进程
+- CLI `--threads` 重命名为 `--processes`（`compress` / `xz` / `bench`），语义由并行线程数
+  改为并行压缩进程数
+- 库 API 同步重命名：`PackConfig.threads` → `PackConfig.processes`，
+  `lzma::lzma2::encode_parallel` 与 `xz::encode_blocks` 的 `threads` 参数 → `processes`
+
+## [0.11.0] - 2026-11-13
+
+### 新增
+
+- LZMA2 多线程压缩：`lzma::lzma2::encode_parallel` 并行编码各块，输出与单线程逐字节一致
+- `.xz` 多块 / 流式：`xz::encode_blocks` 支持多块并行压缩，`xz::decode` 支持多块流解码
+- CLI `xz` 新增 `--block-size` / `--threads`，可产出多块 `.xz` 并并行压缩
+- 基准：`bench` 新增 LZMA2 压缩 / 解压与多线程 LZMA2 压缩吞吐
+
+### 变更
+
+- 清理 clippy 告警（`.is_multiple_of` / `div_ceil` / 引用比较 / 字节串常量等）
+
+## [0.10.0] - 2026-11-13
+
+### 新增
+
+- LZMA2 编解码器：新增 `lzma::lzma2` 标准 LZMA2 分块编解码，复用 LZMA1 内核，
+  支持跨块续解码、未压缩块与字典 / 状态重置语义
+- `.xz` 容器：新增 `xz` 库模块，读写标准 `.xz`（LZMA2 过滤器 + CRC32 校验），
+  与系统 xz 字节级互操作（RZP2 写出的 `.xz` 可由 `xz -d` 解压，反之亦然）
+- CRC 原语：新增 `crc` 模块，提供 CRC32（IEEE 802.3）与 CRC64（ECMA-182）
+- CLI：新增 `xz` / `unxz` 子命令，压缩为标准 `.xz` 或解压 `.xz`；支持 `--level` /
+  `--dict-size` / `--dry-run` / `--force`
+- 文档与补全：README / API / man / ROADMAP 及四种 shell 补全同步新增 `xz` / `unxz`
+
+## [0.9.0] - 2026-11-13
+
+### 新增
+
+- 性能基准：新增 `bench` 子命令，内置 LZMA 压缩 / 解压、ML-KEM-768 密钥生成 / 封装 /
+  解封装，以及管线打包 / 解包（未加密与加密）的吞吐与每秒操作数基准，可用 `--size` 调整数据大小
+- 外部对比：`bench` 自动检测 `xz` / `zstd` / `7z`，与 RZP2 同表对比压缩吞吐与压缩后占比；
+  LZMA 类工具对齐 level 5 / 8 MiB 字典 / lc3-lp0-pb2，缺失工具自动跳过
+- 文档与补全：README / man / ROADMAP 及四种 shell 补全同步新增 `bench`
+
+## [0.8.0] - 2026-11-13
+
+### 新增
+
+- 详细进度条：压缩 / 解压 / 分片 / 合并均显示 `[===>   ]` 风格进度条，包含百分比、
+  工作类型（压缩 / 压缩+加密 / 解压 / 解密+解压 / 分片 / 合并）与已处理字节数；仅在
+  stderr 为终端时启用
+- 文件分片与合并：新增 `split` / `merge` 子命令，自研二进制清单（`RZP2SPL1`）记录
+  原始文件名、分片数、每片大小与总大小；把文件切成 `<prefix>.part.NNNNN` 等大小分片，
+  再按清单顺序合并还原并校验总大小
+- 库模块：新增 `progress`（零依赖进度条 + `ProgressReader` / `ProgressWriter`）与
+  `split`（分片 / 合并 + 清单编解码）
+
+## [0.7.0] - 2026-11-07
+
+### 新增
+
+- CLI：`compress` / `decompress` 支持 `--dry-run`，只打印将执行的动作而不实际读写
+- CLI：`decompress --entry <path>` 从归档中抽取单个条目（配合 `-o -` 输出到 stdout）
+- CLI：`list -l/--long` 长格式（权限、大小、mtime、符号链接目标），`--human-readable` 以
+  B / KiB / MiB 等可读单位显示大小
+- CLI：`--password -` / `--key-password -` / `--private-password -` 在终端下无回显读取，
+  设置口令（压缩 / keygen）时二次确认
+- 归档流式解包：`decompress` 对归档按条目增量落盘，文件内容以分块形式写出，避免整包
+  `decode_archive` 到内存（`StreamUnpacker` + `EntrySink`）
+- SIMD：ChaCha20 在 aarch64 上补 NEON 4 路并行快路径（运行时检测 + 标量兜底）
+- SIMD：Poly1305 在 aarch64 上补 NEON 2 路并行乘加快路径（运行时检测 + 标量兜底）
+
+### 修复
+
+- ChaCha20 AVX2 快路径转置阶段以 256 位 store 写入 64 字缓冲区，存在越界写；改为 128 位
+  store 仅写低 4 lane
+- 归档流式解包对「结束标记与尾随字节同批喂入」未报错，现统一拒绝尾随数据
+- ML-KEM `poly_frommsg` 用乘法替代消息位相关分支，消除密钥相关数据依赖控制流
+
+## [0.6.0] - 2026-11-06
+
+### 新增
+
+- 自解压（SFX）：新增 `sfx` 子命令，把 `rzp2` 自身作为存根追加 `.rzp2` 载荷生成自解压可执行文件
+- 运行时自检测：启动时识别内嵌载荷（尾部 footer `RZP2SFX` + 8 字节小端载荷长度）并解压到当前目录
+- SFX 支持未加密 / 口令加密容器（口令加密运行时提示输入口令）；ML-KEM 加密容器提示改用
+  `decompress --private-key`
+- 文档与补全：README / FORMAT / ROADMAP / man 及四种 shell 补全同步新增 `sfx`
+
+## [0.5.0] - 2026-11-06
+
+### 新增
+
+- LZMA 匹配器升级：延迟匹配（lazy matching）与级别自适应的哈希链深度 / 快速停断阈值，
+  提升高压缩级别压缩率
+- 分块并行压缩：`--threads <n>`（>1 启用分块 LZMA 载荷，v3 `BLOCKED` 标志）+ `--block-size <bytes>`
+- 多接收者加密：`--public-key` 可重复指定多把公钥，采用随机 DEK + 每接收者独立封装
+  （v3 `MULTI` 标志，复用头部第 7 字节作为 flags2 扩展）
+- 归档过滤器：`--include` / `--exclude`（零依赖 glob 匹配），选择性打包目录条目
+
+### 变更
+
+- 容器 v3 头部第 7 字节（原 reserved）复用为 flags2，承载 `MULTI` 与 `BLOCKED` 两个扩展标志
+- `PackConfig` 新增 `threads` 与 `block_size` 字段
+- 压缩 / 补全帮助文本新增 `--include` / `--exclude` / `--threads` / `--block-size` 选项
+
+## [0.4.1] - 2026-11-06
+
+### 新增
+
+- `-o` / `--output` 改为可选：压缩默认输出 `<input>.rzp2`，解压默认去掉 `.rzp2` 还原原名
+
+### 修复
+
+- 目录归档相对路径改为始终相对顶层目录计算，修复嵌套文件 / 目录解压后层级被平铺到同一目录的问题
+
+## [0.4.0] - 2026-11-06
+
+### 新增
+
+- 分块 AEAD（v3 容器）：压缩流切成 64 KiB 块逐块加密为 `len + ct + tag` 帧，每帧独立
+  nonce 派生（基准 nonce 与帧序号异或），AAD 绑定头部字节 + 帧序号，防止重排 / 截断 / 重放
+- 流式压缩：单文件（无校验和）边读边压缩边加密直接落盘，不再整包驻留内存
+- SIMD 加速 ChaCha20（AVX2 快路径，运行时检测 + 纯标量兜底）
+- 私钥口令加密：`keygen --private-password` 输出加密私钥；解压 / 列表 / 校验支持 `--key-password`
+- `--force` / `--overwrite`：覆盖已存在输出文件
+- 流式解压进度条（仅终端启用）
+
+### 变更
+
+- 容器格式升级到 v3：新增 `CHUNKED` 标志位，加密载荷默认采用分块 AEAD；读取端保留 v1 / v2 兼容
+- `hybrid` 拆出 `encapsulate` / `decapsulate` 供流式分块路径复用
+- `pipeline` 新增 `pack_to_writer` 流式打包接口
+
+## [0.3.0] - 2026-11-05
+
+### 新增
+
+- 跨 shell Tab 补全：新增 `completion` 子命令，支持 bash / zsh / fish / PowerShell；可补全子命令（含短别名前缀）、各选项、`--params` / `--level` 取值与文件路径
+- 打包接入：deb / rpm / Arch / Homebrew 安装时自动写入对应 shell 的补全目录；Windows 安装包在安装向导中提供「注册 PowerShell Tab 补全」选项，可移植 zip 附带 `rzp2-completion.ps1`
+
+## [0.2.1] - 2026-11-05
+
+### 新增
+
+- CLI 彩色化：帮助文本、错误、成功状态与 `info` 标签带 ANSI 颜色，非终端（重定向 / 管道）自动禁用；帮助选项说明统一对齐
+
+### 变更
+
+- 移除运行时依赖 `getrandom` 与 `zeroize`：OS 随机源（`crypto::rand`）与密钥清零（`crypto::zeroize`）改为从零实现，达成零运行时第三方依赖
+
+## [0.2.0] - 2026-11-04
+
+### 新增
+
+- 压缩级别与字典大小预设：`--level 0..=9`、`--dict-size`，写入容器头部 `level` 字段
+- 口令加密：Argon2id（RFC 9106）派生对称密钥 + ChaCha20-Poly1305 AEAD，CLI 新增 `--password`（`-` 从 stdin 读取）
+- BLAKE2b（RFC 7693）与 Argon2 原语模块，通过 RFC 官方测试向量
+- 目录归档：递归打包 / 解包，保留相对路径、Unix 权限、mtime 与符号链接
+- 归档流编解码模块（`archive`），路径安全检查（拒绝绝对路径与 `..`）
+- CLI 新增 `list` / `test` / `info` 子命令，查看条目、校验完整性、查看元信息
+- CLI 输入 / 输出支持 `-`（stdin / stdout），便于管道组合
+
+### 变更
+
+- 容器格式升级到 v2：头部新增 `level` 字节，新增 `PASSWORD` / `ARCHIVE` 标志位，
+  支持未知长度（`u64::MAX`）；读取端保留 v1 兼容
+- `pipeline` 接口重构为 `PackConfig` / `Encryption` / `DecryptKey`，统一三种加密模式
+  （无 / ML-KEM / 口令）
+
+### 修复
+
+- `list` 输出条目类型标记的格式（`-` / `d` / `l`）
+
+## [0.1.0] - 2026-11-04
+
+### 新增
+
+- 从零实现 LZMA 编解码器（LZ77 + 范围编码 + 自适应概率模型），码流与 LZMA SDK / xz 兼容
+- ML-KEM（FIPS 203 / Kyber）512 / 768 / 1024 密钥封装，通过 NIST ACVP 官方测试向量
+- ChaCha20-Poly1305 AEAD（RFC 8439）
+- SHAKE-256 KDF 混合加密管线
+- `.rzp2` 容器格式与 PEM 风格密钥文件
+- 命令行子命令 `compress` / `decompress` / `keygen`
+- 跨平台构建与打包脚本、CI、图标与文档
